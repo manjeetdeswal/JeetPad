@@ -16,8 +16,8 @@ from pathlib import Path
 ctk.set_appearance_mode("System")
 ctk.set_default_color_theme("blue")
 if platform.system() == "Linux":
-    ctk.set_widget_scaling(1.2)  # Makes buttons, fonts, and sliders 20% larger
-    ctk.set_window_scaling(1.2)
+    ctk.set_widget_scaling(1.5)  # Makes buttons, fonts, and sliders 20% larger
+    ctk.set_window_scaling(1.5)
 
 # --- RESOURCE PATH HELPER ---
 def resource_path(relative_path):
@@ -536,18 +536,24 @@ class ModernControllerApp(ctk.CTk):
         except Exception:
             image = Image.new('RGB', (64, 64), color=(41, 128, 185))
             
-        menu = pystray.Menu(pystray.MenuItem('Show Settings', self.show_window), pystray.MenuItem('Quit', self.quit_app))
+        menu = pystray.Menu(
+            # default=True enables Left Double-Click on Windows and Left-Click on Linux
+            pystray.MenuItem('Show Settings', self.show_window, default=True), 
+            pystray.MenuItem('Quit', self.quit_app)
+        )
         self.icon = pystray.Icon("JeetPad", image, "JeetPad", menu)
         threading.Thread(target=self.icon.run, daemon=True).start()
 
     def show_window(self, icon, item):
         icon.stop()
-        self.deiconify()
+        # .after(0) safely tells the main UI thread to restore the window, preventing Linux freezes
+        self.after(0, self.deiconify)
 
     def quit_app(self, icon, item):
         icon.stop()
-        self.destroy()
-        sys.exit()
+        # Safely shut down the UI thread before killing the python script
+        self.after(0, self.destroy)
+        self.after(100, sys.exit)
 
 if __name__ == "__main__":
     threading.Thread(target=controller_worker, daemon=True).start()
