@@ -354,7 +354,7 @@ class ModernControllerApp(ctk.CTk):
         super().__init__()
         self.title("JeetPad")
         self.geometry("450x700") 
-        self.protocol("WM_DELETE_WINDOW", self.hide_window)
+        self.protocol("WM_DELETE_WINDOW", self.force_quit)
 
         try:
             if platform.system() == "Windows": self.iconbitmap(resource_path("icon.ico"))
@@ -554,6 +554,9 @@ class ModernControllerApp(ctk.CTk):
         # Safely shut down the UI thread before killing the python script
         self.after(0, self.destroy)
         self.after(100, sys.exit)
+    def force_quit(self):
+        self.destroy()
+        os._exit(0)
 
 if __name__ == "__main__":
     threading.Thread(target=controller_worker, daemon=True).start()
