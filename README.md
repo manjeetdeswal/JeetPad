@@ -1,7 +1,31 @@
 # 🎮 JeetPad
 **Turn any game controller into a fully customizable mouse and keyboard.**
 
+## ❤️ Support the Creator
+
+If this app helped you land a job, or if you just want to support open-source development, consider buying me a coffee!
+
+<a href="https://www.patreon.com/cw/UnrealComponent">
+  <img src="https://c5.patreon.com/external/logo/become_a_patron_button.png" alt="Support on Patreon" height="45">
+</a>
+
+
+
+
 JeetPad is a cross-platform desktop utility that allows you to navigate your operating system, browse the web, and control your PC using a standard game controller. It runs silently in the system tray and features a modern, user-friendly interface for remapping buttons on the fly.
+
+
+## 📸 Screenshots
+
+<p align="center">
+  <img src="https://github.com/manjeetdeswal/JeetPad/blob/main/ss/Screenshot%202026-03-21%20215353.png" width="45%" alt="Keyboard" />
+  <img src="https://github.com/manjeetdeswal/JeetPad/blob/main/ss/Screenshot%202026-03-21%20215412.png" width="45%" alt="Display Extension" />
+</p>
+<p align="center">
+    <img src="https://github.com/manjeetdeswal/JeetPad/blob/main/ss/Screenshot%202026-03-21%20215430.png" width="85%" alt="Mic Streaming" />
+</p
+
+
 
 ## ✨ Key Features
 * **Universal Compatibility:** Works seamlessly on both Windows and Linux.
