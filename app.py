@@ -12,6 +12,8 @@ import time
 import platform
 import json
 from pathlib import Path
+import subprocess
+import ctypes
 
 ctk.set_appearance_mode("System")
 ctk.set_default_color_theme("blue")
@@ -38,7 +40,7 @@ CONFIG_FILE = CONFIG_DIR / "config.json"
 
 # --- EXPANDED AVAILABLE ACTIONS ---
 AVAILABLE_ACTIONS = [
-    "None", "Mouse: Left", "Mouse: Right", "Mouse: Middle", "Mouse: Scroll Up", "Mouse: Scroll Down",
+    "None", "Virtual Keyboard","Mouse: Left", "Mouse: Right", "Mouse: Middle", "Mouse: Scroll Up", "Mouse: Scroll Down",
     "Key: space", "Key: enter", "Key: backspace", "Key: tab", "Key: escape", "Key: caps_lock",
     "Key: up", "Key: down", "Key: left", "Key: right",
     "Key: insert", "Key: delete", "Key: home", "Key: end", "Key: page_up", "Key: page_down",
@@ -114,7 +116,18 @@ def set_autostart(enable=True):
 def execute_action(action_str, mouse, keyboard, is_press=True):
     if not action_str or action_str == "None": return
     try:
-        if action_str.startswith("Mouse: "):
+        # --- NEW: VIRTUAL KEYBOARD LAUNCHER ---
+        if action_str == "Virtual Keyboard" and is_press:
+            if platform.system() == "Windows":
+                # Launches the standard Windows On-Screen Keyboard
+                subprocess.Popen("osk", shell=True) 
+            elif platform.system() == "Linux":
+                # Launches the standard Ubuntu/GNOME keyboard
+                subprocess.Popen("onboard", shell=True) 
+            return
+
+        # --- EXISTING MOUSE ACTIONS ---
+        elif action_str.startswith("Mouse: "):
             action = action_str.split(": ")[1]
             if action == "Left": btn = MouseButton.left
             elif action == "Right": btn = MouseButton.right
@@ -128,6 +141,7 @@ def execute_action(action_str, mouse, keyboard, is_press=True):
             else: return
             mouse.press(btn) if is_press else mouse.release(btn)
             
+        # --- EXISTING KEY ACTIONS ---
         elif action_str.startswith("Key: "):
             key_str = action_str.split(": ")[1]
             if hasattr(Key, key_str):
@@ -304,6 +318,15 @@ class VisualPicker(ctk.CTkToplevel):
 
     def build_keyboard_tab(self):
         tab = self.tabs.tab("Keyboard")
+        
+        
+        special_frame = ctk.CTkFrame(tab, fg_color="transparent")
+        special_frame.pack(fill="x", pady=(5, 10), padx=10)
+        
+        # A distinct colored button for the Virtual Keyboard
+        ctk.CTkButton(special_frame, text="💻 Launch Virtual Keyboard", height=35, fg_color="#b35b00", hover_color="#8a4600", 
+                      command=lambda: self.select_action("Virtual Keyboard")).pack(side="left")
+        
         main_kb = ctk.CTkFrame(tab, fg_color="transparent")
         main_kb.pack(side="left", padx=10, pady=10)
         nav_kb = ctk.CTkFrame(tab, fg_color="transparent")
@@ -558,7 +581,20 @@ class ModernControllerApp(ctk.CTk):
         self.destroy()
         os._exit(0)
 
+def is_admin():
+    try:
+        return ctypes.windll.shell32.IsUserAnAdmin()
+    except:
+        return False
+
 if __name__ == "__main__":
+    # --- AUTO-ADMIN ELEVATION FOR WINDOWS ---
+    if platform.system() == "Windows" and not is_admin():
+        # This prompts the user for Admin rights, then restarts the app securely
+        ctypes.windll.shell32.ShellExecuteW(None, "runas", sys.executable, " ".join(sys.argv), None, 1)
+        sys.exit()
+
+    # --- START THE APP ---
     threading.Thread(target=controller_worker, daemon=True).start()
     app = ModernControllerApp()
     app.mainloop()
