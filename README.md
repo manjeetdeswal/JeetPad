@@ -84,7 +84,7 @@ We use PyInstaller to package the app. Make sure your `icon.ico` and `icon.png` 
 
 *For Windows:*<br>
 bash<br><br>
- python -m PyInstaller --noconsole --onefile --name "JeetPad" --icon=icon.ico --add-data "icon.ico;." --add-data "icon.png;." --hidden-import pygame --hidden-      import pynput --hidden-import customtkinter app.py
+python -m PyInstaller --noconsole --onefile --name "JeetPad" --icon=icon.ico --add-data "icon.ico;." --add-data "icon.png;." --hidden-import pygame --hidden-import pynput --hidden-import customtkinter app.py
 
 
 *For Linux:*<br>
