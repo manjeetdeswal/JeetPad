@@ -82,14 +82,14 @@ python app.py
 **4. Build the Standalone Executable:**
 We use PyInstaller to package the app. Make sure your `icon.ico` and `icon.png` are in the root directory.
 
-*For Windows:*
-bash
-python -m PyInstaller --noconsole --onefile --name "JeetPad" --icon=icon.ico --add-data "icon.ico;." --add-data "icon.png;." --hidden-import pygame --hidden-import pynput --hidden-import customtkinter app.py
+*For Windows:*<br>
+bash<br><br>
+ python -m PyInstaller --noconsole --onefile --name "JeetPad" --icon=icon.ico --add-data "icon.ico;." --add-data "icon.png;." --hidden-import pygame --hidden-      import pynput --hidden-import customtkinter app.py
 
 
-*For Linux:*
-bash
-python3 -m PyInstaller --noconsole --onefile --name "JeetPad" --add-data "icon.png:." --hidden-import pygame --hidden-import pynput --hidden-import customtkinter app.py
+*For Linux:*<br>
+ bash<br><br>
+  python3 -m PyInstaller --noconsole --onefile --name "JeetPad" --add-data "icon.png:." --hidden-import pygame --hidden-import pynput --hidden-import customtkinter   app.py
 
 
 ---
