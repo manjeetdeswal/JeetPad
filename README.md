@@ -36,6 +36,8 @@ JeetPad is a cross-platform desktop utility that allows you to navigate your ope
 * **Auto-Scan & Hotplugging:** Automatically detects when a controller is connected or disconnected.
 * **Minimize to Tray:** Runs quietly in the background without cluttering your taskbar.
 * **Start with OS:** One-click toggle to automatically launch the app when your computer boots.
+* * **Combos:** Use Combination of buttons to execute keybaord our mouse events.
+  * * * **Virtual keyboard:** Use Virtual keyboard for typing.
 
 ---
 
