@@ -22,7 +22,7 @@ JeetPad is a cross-platform desktop utility that allows you to navigate your ope
   <img src="https://github.com/manjeetdeswal/JeetPad/blob/main/ss/Screenshot%202026-03-21%20215412.png" width="45%" alt="Display Extension" />
 </p>
 <p align="center">
-    <img src="https://github.com/manjeetdeswal/JeetPad/blob/main/ss/Screenshot%202026-03-21%20215430.png" width="85%" alt="Mic Streaming" />
+    <img src="https://github.com/manjeetdeswal/JeetPad/blob/main/ss/Screenshot%202026-04-10%20071152.png?raw=true" width="85%" alt="Mic Streaming" />
 </p
 
 
