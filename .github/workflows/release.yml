@@ -1,0 +1,183 @@
+# Build JeetPad for Windows + Linux and publish a GitHub Release.
+#
+# How to use:
+#   1. Bump APP_VERSION in app.py (e.g. "1.3" -> "1.4") and push.
+#   2. GitHub -> Actions -> "Build & Release JeetPad" -> Run workflow.
+#
+# The release tag is taken from APP_VERSION (e.g. v1.3) so the in-app update
+# checker always matches what was published.
+
+name: Build & Release JeetPad
+
+on:
+  workflow_dispatch:
+    inputs:
+      release_notes:
+        description: "Extra release notes (optional - commit notes are added automatically)"
+        required: false
+        default: ""
+      prerelease:
+        description: "Mark as pre-release"
+        type: boolean
+        default: false
+      overwrite:
+        description: "Re-publish if this version's tag already exists"
+        type: boolean
+        default: false
+
+permissions:
+  contents: write
+
+env:
+  PYTHON_VERSION: "3.12"
+  PY_DEPS: "pygame-ce pynput customtkinter pystray Pillow pyinstaller"
+
+jobs:
+  prepare:
+    name: Read version
+    runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.ver.outputs.version }}
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+
+      - name: Get APP_VERSION from app.py
+        id: ver
+        run: |
+          VERSION=$(grep -oP '^APP_VERSION\s*=\s*"\K[^"]+' app.py)
+          if [ -z "$VERSION" ]; then
+            echo "::error::Could not find APP_VERSION in app.py"; exit 1
+          fi
+          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
+          echo "Building JeetPad v$VERSION"
+
+      - name: Make sure this version wasn't released already
+        if: ${{ !inputs.overwrite }}
+        run: |
+          if git rev-parse "v${{ steps.ver.outputs.version }}" >/dev/null 2>&1; then
+            echo "::error::Tag v${{ steps.ver.outputs.version }} already exists. Bump APP_VERSION in app.py, or re-run with 'overwrite' ticked."
+            exit 1
+          fi
+
+  build-windows:
+    name: Build Windows (.exe)
+    needs: prepare
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: actions/setup-python@v7
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install ${{ env.PY_DEPS }}
+
+      - name: Check source compiles
+        run: python -m py_compile app.py
+
+      - name: Build with PyInstaller (JeetPad.spec)
+        run: python -m PyInstaller --noconfirm --clean JeetPad.spec
+
+      - name: Verify output
+        shell: bash
+        run: |
+          test -f dist/JeetPad.exe
+          ls -lh dist/JeetPad.exe
+
+      - uses: actions/upload-artifact@v7
+        with:
+          name: windows-build
+          path: dist/JeetPad.exe
+          if-no-files-found: error
+
+  build-linux:
+    name: Build Linux (.zip)
+    needs: prepare
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: actions/setup-python@v7
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+
+      - name: Install system libraries
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libxcb-xinerama0 libxkbcommon-x11-0 zip
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install ${{ env.PY_DEPS }}
+          python -c "import tkinter; print('tkinter OK')"
+
+      - name: Check source compiles
+        run: python -m py_compile app.py
+
+      # pynput/pystray pick their OS backend at runtime, and importing pynput on
+      # Linux needs an X display (CI has none), so PyInstaller can't auto-detect
+      # them - list the backend modules explicitly or the app crashes on launch.
+      - name: Build with PyInstaller
+        run: |
+          python -m PyInstaller --noconfirm --clean --noconsole --onefile --name "JeetPad" \
+            --add-data "icon.png:." \
+            --hidden-import pygame --hidden-import pygame._sdl2 --hidden-import pygame._sdl2.controller \
+            --hidden-import pynput --hidden-import pynput.keyboard._xorg --hidden-import pynput.mouse._xorg \
+            --hidden-import pynput._util.xorg --hidden-import pynput._util.xorg_keysyms \
+            --hidden-import pystray._xorg --hidden-import pystray._appindicator --hidden-import pystray._gtk \
+            --hidden-import customtkinter \
+            app.py
+
+      - name: Package zip (app + icon + install/uninstall scripts)
+        run: |
+          mkdir -p package/JeetPad
+          cp dist/JeetPad icon.png install.sh uninstall.sh package/JeetPad/
+          chmod +x package/JeetPad/JeetPad package/JeetPad/install.sh package/JeetPad/uninstall.sh
+          cd package && zip -r ../JeetPad_Linux.zip JeetPad
+          cd .. && unzip -l JeetPad_Linux.zip
+
+      - uses: actions/upload-artifact@v7
+        with:
+          name: linux-build
+          path: JeetPad_Linux.zip
+          if-no-files-found: error
+
+  release:
+    name: Publish GitHub Release
+    needs: [prepare, build-windows, build-linux]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@v8
+        with:
+          path: artifacts
+          merge-multiple: true
+
+      - name: List release files
+        run: ls -lh artifacts
+
+      - name: Create release
+        uses: softprops/action-gh-release@v3
+        with:
+          tag_name: v${{ needs.prepare.outputs.version }}
+          name: JeetPad v${{ needs.prepare.outputs.version }}
+          target_commitish: ${{ github.sha }}
+          body: |
+            ## Downloads
+            - **Windows:** `JeetPad.exe` - download and double-click to run.
+            - **Linux:** `JeetPad_Linux.zip` - extract, then run `./install.sh`.
+
+            ${{ inputs.release_notes }}
+          generate_release_notes: true
+          prerelease: ${{ inputs.prerelease }}
+          make_latest: ${{ !inputs.prerelease }}
+          overwrite_files: true
+          fail_on_unmatched_files: true
+          files: |
+            artifacts/JeetPad.exe
+            artifacts/JeetPad_Linux.zip
