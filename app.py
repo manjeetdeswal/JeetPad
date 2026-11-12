@@ -1,14 +1,24 @@
+import os
+# CRITICAL: Allow Pygame/SDL2 to read controller inputs without a focused Pygame window
+os.environ["SDL_JOYSTICK_ALLOW_BACKGROUND_EVENTS"] = "1"
+os.environ["PYGAME_HIDE_SUPPORT_PROMPT"] = "1"
+
 import customtkinter as ctk
 import tkinter as tk
 from tkinter import filedialog
 import threading
 import pygame
+try:
+    # SDL GameController API: gives every known pad (Xbox, PlayStation, Switch, 8BitDo...)
+    # the same button/axis layout, instead of raw driver-specific indexes.
+    from pygame._sdl2 import controller as sdl_controller
+except Exception:
+    sdl_controller = None
 from pynput.mouse import Controller as MouseController, Button as MouseButton
 from pynput.keyboard import Controller as KeyboardController, Key
 import pystray
 from PIL import Image, ImageDraw
 import sys
-import os
 import re
 import time
 import math
@@ -27,8 +37,18 @@ try:
 except ImportError:
     winsound = None
 
+# Enable Per-Monitor DPI Awareness on Windows so mouse coordinates & movement never get blocked/scaled weirdly
+if platform.system() == "Windows":
+    try:
+        ctypes.windll.shcore.SetProcessDpiAwareness(1)
+    except Exception:
+        try:
+            ctypes.windll.user32.SetProcessDPIAware()
+        except Exception:
+            pass
+
 # --- APP VERSION & UPDATE REPOSITORY ---
-APP_VERSION = "1.2"
+APP_VERSION = "1.3"
 DEFAULT_GITHUB_REPO = "manjeetdeswal/JeetPad"  # Auto-detected from .git/config if available
 
 # --- THEME & SCALING ---
@@ -145,7 +165,6 @@ def resource_path(relative_path):
     return os.path.join(base_path, relative_path)
 
 def detect_github_repo():
-    """Attempts to auto-detect owner/repo from local .git/config, falling back to DEFAULT_GITHUB_REPO."""
     try:
         git_cfg = Path(os.path.abspath(".")) / ".git" / "config"
         if git_cfg.exists():
@@ -234,9 +253,9 @@ DAISYWHEEL_PETALS = [
 
 def make_profile(std_map, app_rules=""):
     return {
-        "mappings": std_map.copy(),
-        "combo_mappings": {k: "None" for k in BTN_NAMES},
-        "btn_modes": {k: "Normal" for k in BTN_NAMES},
+        "mappings": {int(k): str(v) for k, v in std_map.items()},
+        "combo_mappings": {int(k): "None" for k in BTN_NAMES},
+        "btn_modes": {int(k): "Normal" for k in BTN_NAMES},
         "app_rules": app_rules
     }
 
@@ -251,7 +270,7 @@ DEFAULT_PROFILES = {
 APP_STATE = {
     "enabled": True,
     "auto_paused_by_game": False,
-    "color_theme": "Ocean Blue",      # Persisted across app restarts
+    "color_theme": "Ocean Blue",
     "mouse_speed": 14.0,
     "scroll_speed": 1.5,
     "deadzone": 0.14,
@@ -259,11 +278,11 @@ APP_STATE = {
     "trigger_Precision": True,
     "turbo_rate": 12.0,
     "hud_enabled": False,
-    "auto_switch_profiles": True,
-    "auto_pause_fullscreen": True,
+    "auto_switch_profiles": False,
+    "auto_pause_fullscreen": False,
+    "defaults_v12_migrated": True,
     "check_updates_on_startup": True,
     "github_repo": detect_github_repo(),
-    # --- 6 OPTIONAL EXTENSIONS (ALL DISABLED BY DEFAULT) ---
     "radial_wheel_enabled": False,
     "daisywheel_enabled": False,
     "edge_wrap_enabled": False,
@@ -272,16 +291,15 @@ APP_STATE = {
     "audio_beeps_enabled": False,
     "laser_ring_enabled": False,
     "radial_slots": json.loads(json.dumps(DEFAULT_RADIAL_SLOTS)),
-    # --- SCANNING & PROFILES ---
     "auto_scan": True,
     "scan_interval": 5.0,
     "available_controllers": ["Scanning..."],
     "selected_controller_idx": 0,
     "rescan_requested": False,
     "toggle_button": 7,
-    "combo_modifier": "LB",
+    "combo_modifier": "None",
     "active_profile": "Desktop",
-    "profiles": json.loads(json.dumps(DEFAULT_PROFILES)),
+    "profiles": {k: make_profile(v["mappings"], v["app_rules"]) for k, v in DEFAULT_PROFILES.items()},
     # --- RUNTIME-ONLY TELEMETRY ---
     "mod_currently_held": False,
     "hud_visible": False,
@@ -301,19 +319,74 @@ APP_STATE = {
 
 STATE_LOCK = threading.Lock()
 
+# --- NATIVE WIN32 + PYNPUT MOUSE & SCROLL HELPERS ---
+def native_mouse_move_rel(dx, dy, fallback_mouse):
+    """Moves mouse reliably using Win32 mouse_event on Windows, or pynput on Linux."""
+    ix, iy = int(dx), int(dy)
+    if ix == 0 and iy == 0:
+        return
+    if platform.system() == "Windows":
+        try:
+            # MOUSEEVENTF_MOVE = 0x0001
+            ctypes.windll.user32.mouse_event(0x0001, ix, iy, 0, 0)
+            return
+        except Exception:
+            pass
+    try:
+        fallback_mouse.move(ix, iy)
+    except Exception:
+        pass
+
+def native_mouse_button(button_name, is_press, fallback_mouse):
+    """Clicks reliably using Win32 mouse_event on Windows, or pynput on Linux."""
+    if platform.system() == "Windows":
+        try:
+            flag = 0
+            if button_name == "Left":
+                flag = 0x0002 if is_press else 0x0004
+            elif button_name == "Right":
+                flag = 0x0008 if is_press else 0x0010
+            elif button_name == "Middle":
+                flag = 0x0020 if is_press else 0x0040
+            if flag:
+                ctypes.windll.user32.mouse_event(flag, 0, 0, 0, 0)
+                return
+        except Exception:
+            pass
+    btn_map = {"Left": MouseButton.left, "Right": MouseButton.right, "Middle": MouseButton.middle}
+    btn = btn_map.get(button_name)
+    if btn:
+        if is_press:
+            fallback_mouse.press(btn)
+        else:
+            fallback_mouse.release(btn)
+
+def native_mouse_scroll(dx, dy, fallback_mouse):
+    """Scrolls vertically or horizontally using Win32 mouse_event or pynput."""
+    if platform.system() == "Windows":
+        try:
+            if dy != 0:
+                # MOUSEEVENTF_WHEEL = 0x0800, WHEEL_DELTA = 120
+                ctypes.windll.user32.mouse_event(0x0800, 0, 0, int(dy * 120), 0)
+            if dx != 0:
+                # MOUSEEVENTF_HWHEEL = 0x01000
+                ctypes.windll.user32.mouse_event(0x01000, 0, 0, int(dx * 120), 0)
+            return
+        except Exception:
+            pass
+    try:
+        fallback_mouse.scroll(int(dx), int(dy))
+    except Exception:
+        pass
+
 # --- UPDATE CHECKER ENGINE ---
 def parse_semver(ver_str):
-    """Extracts a comparable integer tuple from version strings like 'v1.2' or '1.2.1'."""
     nums = [int(x) for x in re.findall(r"\d+", str(ver_str))[:4]]
     while len(nums) < 3:
         nums.append(0)
     return tuple(nums)
 
 def fetch_latest_github_release(repo_slug):
-    """
-    Queries GitHub API for the latest release or tag.
-    Returns dict: {"status": "update_available"|"up_to_date"|"error", "latest_ver": str, "url": str, "notes": str, "msg": str}
-    """
     headers = {
         "User-Agent": f"JeetPad-Updater/{APP_VERSION}",
         "Accept": "application/vnd.github.v3+json"
@@ -382,15 +455,40 @@ def get_current_profile():
         APP_STATE["active_profile"] = prof_name
     return profs[prof_name]
 
-def sanitize_profile_dict(prof):
-    base = make_profile(BASE_DESKTOP_MAP)
-    if "mappings" in prof:
-        base["mappings"].update({int(k): v for k, v in prof["mappings"].items()})
-    if "combo_mappings" in prof:
-        base["combo_mappings"].update({int(k): v for k, v in prof["combo_mappings"].items()})
-    if "btn_modes" in prof:
-        base["btn_modes"].update({int(k): v for k, v in prof["btn_modes"].items()})
-    base["app_rules"] = str(prof.get("app_rules", ""))
+def get_dict_val(d, btn_id, default="None"):
+    """Safely fetches a button value whether the dictionary key is int or str."""
+    if not isinstance(d, dict):
+        return default
+    if int(btn_id) in d:
+        return d[int(btn_id)]
+    if str(btn_id) in d:
+        return d[str(btn_id)]
+    return default
+
+def sanitize_profile_dict(prof, profile_name="Desktop"):
+    default_template = DEFAULT_PROFILES.get(profile_name, DEFAULT_PROFILES["Desktop"])
+    base = make_profile(default_template["mappings"], default_template["app_rules"])
+    if isinstance(prof, dict):
+        if "mappings" in prof and isinstance(prof["mappings"], dict):
+            for k, v in prof["mappings"].items():
+                try:
+                    base["mappings"][int(k)] = str(v)
+                except Exception:
+                    pass
+        if "combo_mappings" in prof and isinstance(prof["combo_mappings"], dict):
+            for k, v in prof["combo_mappings"].items():
+                try:
+                    base["combo_mappings"][int(k)] = str(v)
+                except Exception:
+                    pass
+        if "btn_modes" in prof and isinstance(prof["btn_modes"], dict):
+            for k, v in prof["btn_modes"].items():
+                try:
+                    base["btn_modes"][int(k)] = str(v)
+                except Exception:
+                    pass
+        if "app_rules" in prof:
+            base["app_rules"] = str(prof.get("app_rules", ""))
     return base
 
 def load_config():
@@ -399,13 +497,16 @@ def load_config():
             with open(CONFIG_FILE, "r", encoding="utf-8") as f:
                 saved = json.load(f)
             with STATE_LOCK:
-                if "profiles" in saved:
+                if "profiles" in saved and isinstance(saved["profiles"], dict):
                     cleaned_profiles = {}
                     for p_name, p_data in saved["profiles"].items():
-                        cleaned_profiles[p_name] = sanitize_profile_dict(p_data)
+                        cleaned_profiles[p_name] = sanitize_profile_dict(p_data, p_name)
+                    for def_name, def_data in DEFAULT_PROFILES.items():
+                        if def_name not in cleaned_profiles:
+                            cleaned_profiles[def_name] = sanitize_profile_dict(def_data, def_name)
                     APP_STATE["profiles"] = cleaned_profiles
                 elif "mappings" in saved:
-                    APP_STATE["profiles"]["Desktop"] = sanitize_profile_dict(saved)
+                    APP_STATE["profiles"]["Desktop"] = sanitize_profile_dict(saved, "Desktop")
 
                 exclude = {
                     "profiles", "available_controllers", "rescan_requested",
@@ -420,11 +521,19 @@ def load_config():
                     if k not in exclude and k in APP_STATE:
                         APP_STATE[k] = v
 
-                # Ensure repo stays synced to current DEFAULT_GITHUB_REPO / .git
                 APP_STATE["github_repo"] = detect_github_repo()
 
                 if "radial_wheel_enabled" not in saved:
                     APP_STATE["hud_enabled"] = False
+
+                if not saved.get("defaults_v12_migrated", False):
+                    APP_STATE["auto_switch_profiles"] = False
+                    APP_STATE["auto_pause_fullscreen"] = False
+                    APP_STATE["defaults_v12_migrated"] = True
+
+                # Ensure auto_paused_by_game is never stuck True when fullscreen pause is off
+                if not APP_STATE.get("auto_pause_fullscreen", False):
+                    APP_STATE["auto_paused_by_game"] = False
 
                 if APP_STATE.get("color_theme") not in THEME_PRESETS:
                     APP_STATE["color_theme"] = "Ocean Blue"
@@ -528,7 +637,7 @@ def teleport_cursor_center(mouse):
             if ctypes.windll.user32.GetWindowRect(hwnd, ctypes.byref(rect)):
                 cx = (rect.left + rect.right) // 2
                 cy = (rect.top + rect.bottom) // 2
-                mouse.position = (cx, cy)
+                ctypes.windll.user32.SetCursorPos(cx, cy)
                 return
     l, t, r, b = get_virtual_screen_bounds()
     mouse.position = ((l + r) // 2, (t + b) // 2)
@@ -911,27 +1020,17 @@ def execute_action(action_str, mouse, keyboard, is_press=True):
 
         elif action_str.startswith("Mouse: "):
             action = action_str.split(": ", 1)[1]
-            if action == "Left": btn = MouseButton.left
-            elif action == "Right": btn = MouseButton.right
-            elif action == "Middle": btn = MouseButton.middle
-            elif action == "Scroll Up":
-                if is_press: mouse.scroll(0, 1)
-                return
-            elif action == "Scroll Down":
-                if is_press: mouse.scroll(0, -1)
-                return
-            elif action == "Scroll Left":
-                if is_press: mouse.scroll(-1, 0)
-                return
-            elif action == "Scroll Right":
-                if is_press: mouse.scroll(1, 0)
-                return
-            else:
-                return
-            if is_press:
-                mouse.press(btn)
-            else:
-                mouse.release(btn)
+            if action in ("Left", "Right", "Middle"):
+                native_mouse_button(action, is_press, mouse)
+            elif action == "Scroll Up" and is_press:
+                native_mouse_scroll(0, 1, mouse)
+            elif action == "Scroll Down" and is_press:
+                native_mouse_scroll(0, -1, mouse)
+            elif action == "Scroll Left" and is_press:
+                native_mouse_scroll(-1, 0, mouse)
+            elif action == "Scroll Right" and is_press:
+                native_mouse_scroll(1, 0, mouse)
+            return
 
         elif action_str.startswith("Key: "):
             key_obj = resolve_key(action_str.split(": ", 1)[1])
@@ -956,7 +1055,7 @@ def apply_deadzone(val, deadzone):
         return 0.0
     sign = 1.0 if val > 0 else -1.0
     normalized = (abs(val) - deadzone) / max(0.01, (1.0 - deadzone))
-    return sign * (0.4 * normalized + 0.6 * (normalized ** 2))
+    return sign * (0.45 * normalized + 0.55 * (normalized ** 2))
 
 def compute_8way_sector(x, y, threshold=0.38):
     mag = math.hypot(x, y)
@@ -965,34 +1064,228 @@ def compute_8way_sector(x, y, threshold=0.38):
     angle = (math.degrees(math.atan2(x, -y)) + 360.0) % 360.0
     return int(((angle + 22.5) % 360.0) // 45.0)
 
+# --- UNIFIED CONTROLLER READER ---
+# SDL GameController button -> JeetPad standard button id (see BTN_NAMES)
+if sdl_controller is not None:
+    SDL_CTRL_BUTTON_TO_STD = {
+        pygame.CONTROLLER_BUTTON_A: 0,
+        pygame.CONTROLLER_BUTTON_B: 1,
+        pygame.CONTROLLER_BUTTON_X: 2,
+        pygame.CONTROLLER_BUTTON_Y: 3,
+        pygame.CONTROLLER_BUTTON_LEFTSHOULDER: 4,
+        pygame.CONTROLLER_BUTTON_RIGHTSHOULDER: 5,
+        pygame.CONTROLLER_BUTTON_BACK: 6,
+        pygame.CONTROLLER_BUTTON_START: 7,
+        pygame.CONTROLLER_BUTTON_LEFTSTICK: 8,
+        pygame.CONTROLLER_BUTTON_RIGHTSTICK: 9,
+        pygame.CONTROLLER_BUTTON_GUIDE: 10,
+        15: 11,   # SDL_CONTROLLER_BUTTON_MISC1 (Xbox Share / PS5 Mic / Switch Capture)
+        20: 12,   # SDL_CONTROLLER_BUTTON_TOUCHPAD (PS4 / PS5)
+    }
+else:
+    SDL_CTRL_BUTTON_TO_STD = {}
+
+
+class PadDevice:
+    """Wraps one physical controller and always reports it in JeetPad's standard layout.
+
+    Uses SDL's GameController API when SDL knows the pad (almost every modern controller),
+    so A/B/X/Y, bumpers, D-pad, sticks and triggers land on the right ids regardless of
+    whether Windows exposes it through XInput, RawInput, HIDAPI or DirectInput.
+    Unknown generic pads fall back to the raw joystick with best-guess axis indexes.
+    """
+
+    def __init__(self, device_index):
+        self.index = device_index
+        self.ctrl = None
+        self.joy = None
+        self.has_triggers = True
+        if sdl_controller is not None:
+            try:
+                if sdl_controller.is_controller(device_index):
+                    self.ctrl = sdl_controller.Controller(device_index)
+            except Exception:
+                self.ctrl = None
+        if self.ctrl is None:
+            self.joy = pygame.joystick.Joystick(device_index)
+            self.joy.init()
+
+    @property
+    def name(self):
+        try:
+            if self.ctrl is not None:
+                return str(self.ctrl.name)
+            return self.joy.get_name()
+        except Exception:
+            return "Controller"
+
+    @property
+    def kind(self):
+        return "Gamepad" if self.ctrl is not None else "Generic"
+
+    def rumble(self, low, high, duration_ms):
+        try:
+            if self.ctrl is not None:
+                return self.ctrl.rumble(low, high, duration_ms)
+            return self.joy.rumble(low, high, duration_ms)
+        except Exception:
+            return False
+
+    @staticmethod
+    def _norm_axis(v):
+        return max(-1.0, min(1.0, v / 32767.0))
+
+    def read(self):
+        """Returns (buttons{std_id: bool}, (hat_x, hat_y), (lx, ly, rx, ry), (lt, rt), has_triggers).
+        Sticks are -1..1 (down = +), triggers are 0..1."""
+        if self.ctrl is not None:
+            c = self.ctrl
+            if not c.attached():
+                raise RuntimeError("controller detached")
+            buttons = {}
+            for sdl_btn, std_id in SDL_CTRL_BUTTON_TO_STD.items():
+                try:
+                    buttons[std_id] = bool(c.get_button(sdl_btn))
+                except Exception:
+                    buttons[std_id] = False
+            hx = (1 if c.get_button(pygame.CONTROLLER_BUTTON_DPAD_RIGHT) else 0) - \
+                 (1 if c.get_button(pygame.CONTROLLER_BUTTON_DPAD_LEFT) else 0)
+            hy = (1 if c.get_button(pygame.CONTROLLER_BUTTON_DPAD_UP) else 0) - \
+                 (1 if c.get_button(pygame.CONTROLLER_BUTTON_DPAD_DOWN) else 0)
+            lx = self._norm_axis(c.get_axis(pygame.CONTROLLER_AXIS_LEFTX))
+            ly = self._norm_axis(c.get_axis(pygame.CONTROLLER_AXIS_LEFTY))
+            rx = self._norm_axis(c.get_axis(pygame.CONTROLLER_AXIS_RIGHTX))
+            ry = self._norm_axis(c.get_axis(pygame.CONTROLLER_AXIS_RIGHTY))
+            lt = max(0.0, self._norm_axis(c.get_axis(pygame.CONTROLLER_AXIS_TRIGGERLEFT)))
+            rt = max(0.0, self._norm_axis(c.get_axis(pygame.CONTROLLER_AXIS_TRIGGERRIGHT)))
+            return buttons, (hx, hy), (lx, ly, rx, ry), (lt, rt), True
+
+        # ---- Raw joystick fallback (pads SDL has no mapping for) ----
+        j = self.joy
+        num_axes = j.get_numaxes()
+        num_buttons = j.get_numbuttons()
+        num_hats = j.get_numhats()
+
+        buttons = {}
+        for b_idx in range(min(num_buttons, 13)):
+            try:
+                buttons[b_idx] = bool(j.get_button(b_idx))
+            except Exception:
+                buttons[b_idx] = False
+
+        hx, hy = 0, 0
+        if num_hats > 0:
+            try:
+                hx, hy = j.get_hat(0)
+            except Exception:
+                hx, hy = 0, 0
+
+        if platform.system() == "Linux":
+            rx_axis = 3 if num_axes > 3 else 2
+            ry_axis = 4 if num_axes > 4 else 3
+            lt_axis, rt_axis = 2, 5
+        else:
+            rx_axis, ry_axis = 2, 3
+            lt_axis, rt_axis = 4, 5
+        if lt_axis >= num_axes or lt_axis in (rx_axis, ry_axis): lt_axis = -1
+        if rt_axis >= num_axes or rt_axis in (rx_axis, ry_axis): rt_axis = -1
+
+        def ax(i):
+            return j.get_axis(i) if 0 <= i < num_axes else 0.0
+
+        lx, ly = ax(0), ax(1)
+        rx, ry = ax(rx_axis), ax(ry_axis)
+
+        def trig(i):
+            if i == -1:
+                return 0.0
+            raw = j.get_axis(i)
+            return (raw + 1.0) / 2.0 if (raw < -0.05 or raw > 0.05) else 0.0
+
+        has_trig = lt_axis != -1 or rt_axis != -1
+        return buttons, (hx, hy), (lx, ly, rx, ry), (trig(lt_axis), trig(rt_axis)), has_trig
+
+    def close(self):
+        try:
+            if self.ctrl is not None:
+                self.ctrl.quit()
+            elif self.joy is not None:
+                self.joy.quit()
+        except Exception:
+            pass
+
+
+def init_sdl_input():
+    """Must run on the SAME thread that polls the controller.
+    On Windows, SDL's RawInput/HIDAPI backends deliver controller data as window
+    messages to the thread that initialised them; if nobody pumps that thread the
+    pad is detected but every button/axis stays frozen at 0."""
+    try:
+        pygame.display.init()   # required for pygame.event.* (no window is created)
+    except Exception:
+        pass
+    try:
+        pygame.joystick.init()
+    except Exception:
+        pass
+    if sdl_controller is not None:
+        try:
+            sdl_controller.init()
+        except Exception:
+            pass
+
 # --- BACKGROUND CONTROLLER & TELEMETRY WORKER ---
 def controller_worker():
-    pygame.init()
+    init_sdl_input()
     joysticks = {}
 
-    def perform_scan():
-        pygame.joystick.quit()
-        pygame.joystick.init()
-        joysticks.clear()
-        names = []
-        count = pygame.joystick.get_count()
-        for i in range(count):
-            try:
-                j = pygame.joystick.Joystick(i)
-                j.init()
-                joysticks[i] = j
-                names.append(f"[{i}] {j.get_name()}")
-            except Exception:
-                pass
-        with STATE_LOCK:
-            if not names:
-                names = ["No Controller Detected"]
-                APP_STATE["selected_controller_idx"] = 0
-            APP_STATE["available_controllers"] = names
-            if APP_STATE["selected_controller_idx"] >= len(joysticks) and len(joysticks) > 0:
-                APP_STATE["selected_controller_idx"] = 0
+    def refresh_joysticks(force_reinit=False, rebuild=False):
+        try:
+            if force_reinit:
+                for dev in joysticks.values():
+                    dev.close()
+                joysticks.clear()
+                if sdl_controller is not None:
+                    try:
+                        sdl_controller.quit()
+                    except Exception:
+                        pass
+                pygame.joystick.quit()
+                pygame.joystick.init()
+                if sdl_controller is not None:
+                    try:
+                        sdl_controller.init()
+                    except Exception:
+                        pass
+            elif not pygame.joystick.get_init():
+                pygame.joystick.init()
 
-    perform_scan()
+            count = pygame.joystick.get_count()
+            if not force_reinit and not rebuild and count == len(joysticks) and count > 0:
+                return
+
+            for dev in joysticks.values():
+                dev.close()
+            joysticks.clear()
+            names = []
+            for i in range(count):
+                try:
+                    dev = PadDevice(i)
+                    joysticks[i] = dev
+                    names.append(f"[{i}] {dev.name}")
+                except Exception:
+                    pass
+            with STATE_LOCK:
+                if not names:
+                    names = ["No Controller Detected"]
+                    APP_STATE["selected_controller_idx"] = 0
+                APP_STATE["available_controllers"] = names
+                if APP_STATE["selected_controller_idx"] >= len(joysticks) and len(joysticks) > 0:
+                    APP_STATE["selected_controller_idx"] = 0
+        except Exception:
+            pass
+
+    refresh_joysticks(force_reinit=True)
     mouse, keyboard = MouseController(), KeyboardController()
     HOLD_DURATION = 3.0
 
@@ -1004,9 +1297,14 @@ def controller_worker():
 
     last_hat_x, last_hat_y = 0, 0
     last_sec_x = 0.0
-    last_lt, last_rt = -1.0, -1.0
+    last_lt, last_rt = 0.0, 0.0
+
+    # Sub-pixel accumulators so even slow stick movements smoothly move the Windows cursor
+    move_accum_x = 0.0
+    move_accum_y = 0.0
     scroll_accumulator = 0.0
 
+    prev_btn_states = {}
     active_presses = {}
     turbo_held = {}
     toggle_latched = {}
@@ -1019,20 +1317,21 @@ def controller_worker():
         active_presses.clear()
         turbo_held.clear()
         toggle_latched.clear()
+        prev_btn_states.clear()
         APP_STATE["pressed_buttons"].clear()
         APP_STATE["toggled_buttons"].clear()
         APP_STATE["radial_active"] = False
         APP_STATE["laser_ring_active"] = False
 
-    def is_modifier_held(joystick, lt_axis, rt_axis):
+    def is_modifier_held(buttons, lt_norm, rt_norm):
         mod = APP_STATE["combo_modifier"]
         if mod == "None":
             return False
         try:
-            if mod == "LT" and lt_axis != -1: return joystick.get_axis(lt_axis) > 0.1
-            if mod == "RT" and rt_axis != -1: return joystick.get_axis(rt_axis) > 0.1
-            if mod == "LB" and joystick.get_numbuttons() > 4: return bool(joystick.get_button(4))
-            if mod == "RB" and joystick.get_numbuttons() > 5: return bool(joystick.get_button(5))
+            if mod == "LT": return lt_norm > 0.35
+            if mod == "RT": return rt_norm > 0.35
+            if mod == "LB": return bool(buttons.get(4, False))
+            if mod == "RB": return bool(buttons.get(5, False))
         except Exception:
             pass
         return False
@@ -1040,10 +1339,10 @@ def controller_worker():
     def resolve_mapping_action(btn_id, is_combo):
         prof = get_current_profile()
         if is_combo:
-            combo_act = prof["combo_mappings"].get(btn_id, "None")
+            combo_act = get_dict_val(prof.get("combo_mappings", {}), btn_id, "None")
             if combo_act and combo_act != "None":
                 return combo_act
-        return prof["mappings"].get(btn_id, "None")
+        return get_dict_val(prof.get("mappings", {}), btn_id, "None")
 
     def handle_daisywheel_button(btn_id):
         petal_idx = APP_STATE.get("daisywheel_petal_idx", -1)
@@ -1103,7 +1402,7 @@ def controller_worker():
             toggle_held, toggle_press_time, toggle_executed = True, current_time, False
         elif APP_STATE["enabled"] and not APP_STATE["auto_paused_by_game"]:
             prof = get_current_profile()
-            mode = prof["btn_modes"].get(btn_id, "Normal")
+            mode = get_dict_val(prof.get("btn_modes", {}), btn_id, "Normal")
             action = resolve_mapping_action(btn_id, is_combo)
             if not action or action == "None":
                 return
@@ -1148,8 +1447,24 @@ def controller_worker():
             if action:
                 execute_action(action, mouse, keyboard, False)
 
+    devices_changed = False
     while True:
         current_time = time.time()
+
+        # Pump SDL on THIS thread so controller state actually updates (see init_sdl_input).
+        try:
+            for ev in pygame.event.get():
+                if ev.type in (pygame.JOYDEVICEADDED, pygame.JOYDEVICEREMOVED,
+                               pygame.CONTROLLERDEVICEADDED, pygame.CONTROLLERDEVICEREMOVED):
+                    devices_changed = True
+        except Exception:
+            pass
+
+        if devices_changed:
+            devices_changed = False
+            release_all_active()
+            refresh_joysticks(rebuild=True)
+            last_scan_time = current_time
 
         if APP_STATE.get("idle_sleep_enabled", False) and not idle_sleep_triggered:
             timeout_sec = max(1.0, float(APP_STATE.get("idle_timeout_min", 15.0))) * 60.0
@@ -1159,43 +1474,40 @@ def controller_worker():
 
         if current_time - last_win_check >= 1.0:
             last_win_check = current_time
-            win_str, is_fs = get_active_window_info()
-            if win_str:
-                APP_STATE["detected_window"] = win_str[:38]
+            if APP_STATE["auto_pause_fullscreen"] or APP_STATE["auto_switch_profiles"]:
+                win_str, is_fs = get_active_window_info()
+                if win_str:
+                    APP_STATE["detected_window"] = win_str[:38]
 
-            if APP_STATE["auto_pause_fullscreen"]:
-                if is_fs and not APP_STATE["auto_paused_by_game"]:
-                    APP_STATE["auto_paused_by_game"] = True
-                    release_all_active()
-                elif not is_fs and APP_STATE["auto_paused_by_game"]:
+                if APP_STATE["auto_pause_fullscreen"]:
+                    if is_fs and not APP_STATE["auto_paused_by_game"]:
+                        APP_STATE["auto_paused_by_game"] = True
+                        release_all_active()
+                    elif not is_fs and APP_STATE["auto_paused_by_game"]:
+                        APP_STATE["auto_paused_by_game"] = False
+                else:
                     APP_STATE["auto_paused_by_game"] = False
+
+                if APP_STATE["auto_switch_profiles"] and win_str:
+                    with STATE_LOCK:
+                        for p_name, p_data in APP_STATE["profiles"].items():
+                            rules = [r.strip().lower() for r in p_data.get("app_rules", "").split(",") if r.strip()]
+                            if any(r in win_str for r in rules):
+                                if APP_STATE["active_profile"] != p_name:
+                                    APP_STATE["active_profile"] = p_name
+                                    play_audio_cue("profile")
+                                break
             else:
                 APP_STATE["auto_paused_by_game"] = False
 
-            if APP_STATE["auto_switch_profiles"] and win_str:
-                with STATE_LOCK:
-                    for p_name, p_data in APP_STATE["profiles"].items():
-                        rules = [r.strip().lower() for r in p_data.get("app_rules", "").split(",") if r.strip()]
-                        if any(r in win_str for r in rules):
-                            if APP_STATE["active_profile"] != p_name:
-                                APP_STATE["active_profile"] = p_name
-                                play_audio_cue("profile")
-                            break
-
         if APP_STATE["auto_scan"] and (current_time - last_scan_time >= APP_STATE["scan_interval"]):
-            perform_scan()
+            refresh_joysticks(force_reinit=False)
             last_scan_time = current_time
 
         if APP_STATE["rescan_requested"]:
-            perform_scan()
+            refresh_joysticks(force_reinit=True)
             APP_STATE["rescan_requested"] = False
             last_scan_time = current_time
-
-        try:
-            pygame.event.pump()
-        except Exception:
-            time.sleep(0.05)
-            continue
 
         if turbo_held and APP_STATE["enabled"] and not APP_STATE["auto_paused_by_game"]:
             interval = 1.0 / max(1.0, float(APP_STATE.get("turbo_rate", 12.0)))
@@ -1210,26 +1522,14 @@ def controller_worker():
 
         if active_joystick:
             try:
-                active_id = active_joystick.get_instance_id()
-                num_axes = active_joystick.get_numaxes()
+                btn_states, (hx, hy), sticks, (lt_norm, rt_norm), has_triggers = active_joystick.read()
             except Exception:
-                perform_scan()
+                release_all_active()
+                refresh_joysticks(force_reinit=True)
+                time.sleep(0.05)
                 continue
 
-            if platform.system() == "Linux":
-                rx_axis = 3 if num_axes > 3 else 2
-                ry_axis = 4 if num_axes > 4 else 3
-                lt_axis, rt_axis = 2, 5
-            else:
-                rx_axis, ry_axis = 2, 3
-                lt_axis, rt_axis = 4, 5
-
-            if rx_axis >= num_axes: rx_axis = max(0, num_axes - 1)
-            if ry_axis >= num_axes: ry_axis = max(0, num_axes - 1)
-            if lt_axis >= num_axes: lt_axis = -1
-            if rt_axis >= num_axes: rt_axis = -1
-
-            mod_active = is_modifier_held(active_joystick, lt_axis, rt_axis)
+            mod_active = is_modifier_held(btn_states, lt_norm, rt_norm)
             APP_STATE["mod_currently_held"] = mod_active
             if APP_STATE.get("hud_enabled", False):
                 APP_STATE["hud_visible"] = mod_active
@@ -1244,9 +1544,28 @@ def controller_worker():
                 toggle_executed = True
                 save_config()
 
-            if num_axes >= 2:
-                lx, ly = active_joystick.get_axis(0), active_joystick.get_axis(1)
-                rx, ry = active_joystick.get_axis(rx_axis), active_joystick.get_axis(ry_axis)
+            # Buttons (already translated to JeetPad standard ids)
+            for b_idx, is_down in btn_states.items():
+                was_down = prev_btn_states.get(b_idx, False)
+                if is_down and not was_down:
+                    handle_press(b_idx, current_time, mod_active)
+                elif not is_down and was_down:
+                    handle_release(b_idx, mod_active)
+                prev_btn_states[b_idx] = is_down
+
+            # D-Pad (hat on raw pads, buttons on mapped gamepads - unified by PadDevice)
+            if hy == 1 and last_hat_y != 1: handle_press(100, current_time, mod_active)
+            elif last_hat_y == 1 and hy != 1: handle_release(100, mod_active)
+            if hy == -1 and last_hat_y != -1: handle_press(101, current_time, mod_active)
+            elif last_hat_y == -1 and hy != -1: handle_release(101, mod_active)
+            if hx == -1 and last_hat_x != -1: handle_press(102, current_time, mod_active)
+            elif last_hat_x == -1 and hx != -1: handle_release(102, mod_active)
+            if hx == 1 and last_hat_x != 1: handle_press(103, current_time, mod_active)
+            elif last_hat_x == 1 and hx != 1: handle_release(103, mod_active)
+            last_hat_x, last_hat_y = hx, hy
+
+            if sticks is not None:
+                lx, ly, rx, ry = sticks
 
                 if APP_STATE["swap_sticks"]:
                     raw_mx, raw_my = rx, ry
@@ -1255,20 +1574,18 @@ def controller_worker():
                     raw_mx, raw_my = lx, ly
                     raw_sy, sec_stick_x = ry, rx
 
-                lt_norm = (active_joystick.get_axis(lt_axis) + 1.0) / 2.0 if lt_axis != -1 else 0.0
-                rt_norm = (active_joystick.get_axis(rt_axis) + 1.0) / 2.0 if rt_axis != -1 else 0.0
                 APP_STATE["stick_telemetry"] = (raw_mx, raw_my, lt_norm, rt_norm)
 
                 dz = float(APP_STATE.get("deadzone", 0.14))
-                if abs(lx) > dz or abs(ly) > dz or abs(rx) > dz or abs(ry) > dz or lt_norm > 0.15 or rt_norm > 0.15:
+                if abs(lx) > dz or abs(ly) > dz or abs(rx) > dz or abs(ry) > dz or lt_norm > 0.2 or rt_norm > 0.2:
                     last_activity_time = current_time
                     idle_sleep_triggered = False
 
                 speed_mult = 1.0
                 if APP_STATE["trigger_Precision"]:
-                    if lt_norm > 0.08 and APP_STATE["combo_modifier"] != "LT":
+                    if lt_norm > 0.12 and APP_STATE["combo_modifier"] != "LT":
                         speed_mult *= (1.0 - 0.70 * lt_norm)
-                    if rt_norm > 0.08 and APP_STATE["combo_modifier"] != "RT":
+                    if rt_norm > 0.12 and APP_STATE["combo_modifier"] != "RT":
                         speed_mult *= (1.0 + 1.00 * rt_norm)
                 APP_STATE["speed_multiplier"] = speed_mult
 
@@ -1282,17 +1599,27 @@ def controller_worker():
                         mx = apply_deadzone(raw_mx, dz)
                         my = apply_deadzone(raw_my, dz)
                         if mx != 0.0 or my != 0.0:
-                            eff_speed = APP_STATE["mouse_speed"] * speed_mult
-                            mouse.move(mx * eff_speed, my * eff_speed)
-                            if APP_STATE.get("edge_wrap_enabled", False):
-                                apply_edge_wrapping(mouse)
+                            eff_speed = float(APP_STATE["mouse_speed"]) * speed_mult
+                            move_accum_x += mx * eff_speed
+                            move_accum_y += my * eff_speed
+                            step_x = int(move_accum_x)
+                            step_y = int(move_accum_y)
+                            if step_x != 0 or step_y != 0:
+                                native_mouse_move_rel(step_x, step_y, mouse)
+                                move_accum_x -= step_x
+                                move_accum_y -= step_y
+                                if APP_STATE.get("edge_wrap_enabled", False):
+                                    apply_edge_wrapping(mouse)
+                        else:
+                            move_accum_x = 0.0
+                            move_accum_y = 0.0
 
                         sy = apply_deadzone(raw_sy, dz)
                         if sy != 0.0:
-                            scroll_accumulator += (-sy * APP_STATE["scroll_speed"] * 0.25)
+                            scroll_accumulator += (-sy * float(APP_STATE["scroll_speed"]) * 0.25)
                             if abs(scroll_accumulator) >= 1.0:
                                 steps = int(scroll_accumulator)
-                                mouse.scroll(0, steps)
+                                native_mouse_scroll(0, steps, mouse)
                                 scroll_accumulator -= steps
                         else:
                             scroll_accumulator = 0.0
@@ -1305,43 +1632,21 @@ def controller_worker():
                         elif last_sec_x > 0.5 and current_sec_x <= 0.5: handle_release(105, mod_active)
                         last_sec_x = current_sec_x
 
-                    if lt_axis != -1:
-                        current_lt = active_joystick.get_axis(lt_axis)
-                        if current_lt > 0.1 and last_lt <= 0.1: handle_press(106, current_time, mod_active)
-                        elif last_lt > 0.1 and current_lt <= 0.1: handle_release(106, mod_active)
-                        last_lt = current_lt
+                    if has_triggers:
+                        if lt_norm > 0.55 and last_lt <= 0.55: handle_press(106, current_time, mod_active)
+                        elif last_lt > 0.55 and lt_norm <= 0.55: handle_release(106, mod_active)
+                        last_lt = lt_norm
 
-                    if rt_axis != -1:
-                        current_rt = active_joystick.get_axis(rt_axis)
-                        if current_rt > 0.1 and last_rt <= 0.1: handle_press(107, current_time, mod_active)
-                        elif last_rt > 0.1 and current_rt <= 0.1: handle_release(107, mod_active)
-                        last_rt = current_rt
-
-            for event in pygame.event.get():
-                if hasattr(event, "instance_id") and event.instance_id != active_id:
-                    continue
-                if event.type == pygame.JOYBUTTONDOWN:
-                    handle_press(event.button, current_time, mod_active)
-                elif event.type == pygame.JOYBUTTONUP:
-                    handle_release(event.button, mod_active)
-                elif event.type == pygame.JOYHATMOTION and event.hat == 0:
-                    hx, hy = event.value
-                    if hy == 1 and last_hat_y != 1: handle_press(100, current_time, mod_active)
-                    elif last_hat_y == 1 and hy != 1: handle_release(100, mod_active)
-                    if hy == -1 and last_hat_y != -1: handle_press(101, current_time, mod_active)
-                    elif last_hat_y == -1 and hy != -1: handle_release(101, mod_active)
-                    if hx == -1 and last_hat_x != -1: handle_press(102, current_time, mod_active)
-                    elif last_hat_x == -1 and hx != -1: handle_release(102, mod_active)
-                    if hx == 1 and last_hat_x != 1: handle_press(103, current_time, mod_active)
-                    elif last_hat_x == 1 and hx != 1: handle_release(103, mod_active)
-                    last_hat_x, last_hat_y = hx, hy
+                    if has_triggers:
+                        if rt_norm > 0.55 and last_rt <= 0.55: handle_press(107, current_time, mod_active)
+                        elif last_rt > 0.55 and rt_norm <= 0.55: handle_release(107, mod_active)
+                        last_rt = rt_norm
         else:
             APP_STATE["mod_currently_held"] = False
             APP_STATE["hud_visible"] = False
             APP_STATE["radial_active"] = False
             APP_STATE["laser_ring_active"] = False
             APP_STATE["pressed_buttons"].clear()
-            pygame.event.clear()
         time.sleep(0.008)
 
 
@@ -1465,11 +1770,11 @@ class RadialHUDOverlay(ctk.CTkToplevel):
         mod_name = APP_STATE.get("combo_modifier", "Shift")
         self.lbl_header.configure(text=f"⚡ ACTIVE SHORTCUTS  —  Profile: {APP_STATE['active_profile']} (Hold {mod_name})")
         for b_id, lbl in self.cells.items():
-            c_act = prof["combo_mappings"].get(b_id, "None")
+            c_act = get_dict_val(prof.get("combo_mappings", {}), b_id, "None")
             if c_act and c_act != "None":
                 lbl.configure(text=c_act[:26], text_color=COLORS["accent"])
             else:
-                s_act = prof["mappings"].get(b_id, "None")
+                s_act = get_dict_val(prof.get("mappings", {}), b_id, "None")
                 lbl.configure(text=s_act[:26], text_color=COLORS["text_muted"])
         self.deiconify()
         self.lift()
@@ -2178,8 +2483,8 @@ class ModernControllerApp(ctk.CTk):
         load_config()
 
         self.title(f"JeetPad v{APP_VERSION} — Pro Controller Suite")
-        self.geometry("1120x740")
-        self.minsize(1000, 660)
+        self.geometry("1100x720")
+        self.minsize(960, 620)
         self.configure(fg_color=COLORS["bg_dark"])
         self.protocol("WM_DELETE_WINDOW", self.force_quit)
 
@@ -2211,7 +2516,6 @@ class ModernControllerApp(ctk.CTk):
         self.build_layout()
         self.update_ui_loop()
 
-        # Check for updates automatically every time on startup
         if APP_STATE.get("check_updates_on_startup", True):
             self.after(1200, lambda: self.trigger_update_check(manual=False))
 
@@ -2229,7 +2533,6 @@ class ModernControllerApp(ctk.CTk):
             apply_theme_palette(new_theme)
         save_config()
 
-        # Rebuild main dashboard panels cleanly with the new palette
         self.configure(fg_color=COLORS["bg_dark"])
         for w in self.main_containers:
             try:
@@ -2239,7 +2542,6 @@ class ModernControllerApp(ctk.CTk):
         self.main_containers.clear()
         self.build_layout()
 
-        # Update Overlays
         self.hud_overlay.apply_theme()
         self.radial_overlay.apply_theme()
         self.daisywheel_overlay.apply_theme()
@@ -2286,341 +2588,285 @@ class ModernControllerApp(ctk.CTk):
         if status == "update_available" or manual:
             UpdateDialog(self, res)
 
+    # --- SMALL UI BUILDERS (keep the layout code short and consistent) ---
+    def _section(self, parent, title, first=False):
+        ctk.CTkLabel(
+            parent, text=title.upper(), font=ctk.CTkFont(size=11, weight="bold"),
+            text_color=COLORS["accent"], anchor="w"
+        ).pack(fill="x", padx=6, pady=(4 if first else 14, 4))
+
+    def _switch(self, parent, text, is_on, command):
+        sw = ctk.CTkSwitch(parent, text=text, progress_color=COLORS["accent"], command=command)
+        if is_on:
+            sw.select()
+        sw.pack(anchor="w", padx=6, pady=3)
+        return sw
+
+    def _slider(self, parent, label, value_text, value_color, from_, to, value, command):
+        row = ctk.CTkFrame(parent, fg_color="transparent")
+        row.pack(fill="x", padx=6, pady=(4, 0))
+        ctk.CTkLabel(row, text=label).pack(side="left")
+        val_lbl = ctk.CTkLabel(row, text=value_text, text_color=value_color, font=ctk.CTkFont(weight="bold"))
+        val_lbl.pack(side="right")
+        slider = ctk.CTkSlider(parent, from_=from_, to=to, button_color=COLORS["accent"],
+                               progress_color=COLORS["accent"], command=command)
+        slider.set(value)
+        slider.pack(fill="x", padx=6, pady=(2, 6))
+        return val_lbl, slider
+
+    def _option_row(self, parent, label, values, current, command, width=150):
+        row = ctk.CTkFrame(parent, fg_color="transparent")
+        row.pack(fill="x", padx=6, pady=3)
+        ctk.CTkLabel(row, text=label).pack(side="left")
+        opt = ctk.CTkOptionMenu(row, values=values, width=width, fg_color=COLORS["bg_dark"],
+                                button_color=COLORS["accent"], button_hover_color=COLORS["accent_hover"],
+                                command=command)
+        opt.set(current)
+        opt.pack(side="right")
+        return opt
+
+    def _small_btn(self, parent, text, command, width=80):
+        return ctk.CTkButton(parent, text=text, width=width, height=28, fg_color=COLORS["key_special"],
+                             hover_color=COLORS["accent"], command=command)
+
+    def _on_sidebar_tab(self):
+        try:
+            self.current_sidebar_tab = self.sidebar_tabs.get()
+        except Exception:
+            pass
+
     def build_layout(self):
         self.grid_columnconfigure(0, weight=0)
         self.grid_columnconfigure(1, weight=1)
         self.grid_rowconfigure(1, weight=1)
 
-        # --- TOP HEADER ---
-        header = ctk.CTkFrame(self, fg_color=COLORS["card_bg"], corner_radius=14, border_width=1, border_color=COLORS["card_border"])
-        header.grid(row=0, column=0, columnspan=2, sticky="ew", padx=16, pady=(14, 6))
+        # ================= HEADER: status, profile, master switch =================
+        header = ctk.CTkFrame(self, fg_color=COLORS["card_bg"], corner_radius=12, border_width=1, border_color=COLORS["card_border"])
+        header.grid(row=0, column=0, columnspan=2, sticky="ew", padx=14, pady=(12, 6))
         self.main_containers.append(header)
 
         title_box = ctk.CTkFrame(header, fg_color="transparent")
-        title_box.pack(side="left", padx=12, pady=10)
-
-        self.status_dot = ctk.CTkLabel(title_box, text="●", font=ctk.CTkFont(size=22), text_color=COLORS["success"])
+        title_box.pack(side="left", padx=12, pady=8)
+        self.status_dot = ctk.CTkLabel(title_box, text="●", font=ctk.CTkFont(size=20), text_color=COLORS["success"])
         self.status_dot.pack(side="left", padx=(0, 8))
-
         title_stack = ctk.CTkFrame(title_box, fg_color="transparent")
         title_stack.pack(side="left")
-        self.lbl_title = ctk.CTkLabel(title_stack, text=f"JeetPad Active  (v{APP_VERSION})", font=ctk.CTkFont(size=16, weight="bold"), anchor="w")
+        self.lbl_title = ctk.CTkLabel(title_stack, text=f"JeetPad Active  (v{APP_VERSION})", font=ctk.CTkFont(size=15, weight="bold"), anchor="w")
         self.lbl_title.pack(anchor="w")
         self.lbl_hold_hint = ctk.CTkLabel(
-            title_stack,
-            text=f"Hold [{BTN_NAMES.get(APP_STATE['toggle_button'], 'Start')}] 3s to toggle",
+            title_stack, text=f"Hold [{BTN_NAMES.get(APP_STATE['toggle_button'], 'Start')}] 3s to toggle",
             font=ctk.CTkFont(size=11), text_color=COLORS["text_muted"], anchor="w"
         )
         self.lbl_hold_hint.pack(anchor="w")
 
-        # Profile Selector Bar
-        prof_bar = ctk.CTkFrame(header, fg_color=COLORS["bg_dark"], corner_radius=10, border_width=1, border_color=COLORS["card_border"])
-        prof_bar.pack(side="left", padx=8, pady=8, ipadx=4, ipady=3)
+        right_controls = ctk.CTkFrame(header, fg_color="transparent")
+        right_controls.pack(side="right", padx=12, pady=8)
 
-        ctk.CTkLabel(prof_bar, text="Profile:", font=ctk.CTkFont(size=12, weight="bold"), text_color=COLORS["text_muted"]).pack(side="left", padx=(8, 4))
+        self.btn_minimize = ctk.CTkButton(right_controls, text="Hide to Tray", width=96, height=30,
+                                          fg_color=COLORS["key_special"], hover_color=COLORS["accent_hover"],
+                                          command=self.hide_window)
+        self.btn_minimize.pack(side="right", padx=(8, 0))
+
+        self.switch_master = ctk.CTkSwitch(right_controls, text="Enabled", font=ctk.CTkFont(size=13, weight="bold"),
+                                           progress_color=COLORS["success"], width=78, command=self.toggle_master)
+        if APP_STATE["enabled"]:
+            self.switch_master.select()
+        self.switch_master.pack(side="right", padx=8)
+
         self.opt_profile = ctk.CTkOptionMenu(
-            prof_bar, values=list(APP_STATE["profiles"].keys()), width=110, height=28,
-            fg_color=COLORS["card_bg"], button_color=COLORS["accent"], button_hover_color=COLORS["accent_hover"],
+            right_controls, values=list(APP_STATE["profiles"].keys()), width=130, height=30,
+            fg_color=COLORS["bg_dark"], button_color=COLORS["accent"], button_hover_color=COLORS["accent_hover"],
             command=self.change_profile
         )
         self.opt_profile.set(APP_STATE["active_profile"])
-        self.opt_profile.pack(side="left", padx=3)
+        self.opt_profile.pack(side="right", padx=(4, 8))
+        ctk.CTkLabel(right_controls, text="Profile", text_color=COLORS["text_muted"],
+                     font=ctk.CTkFont(size=12, weight="bold")).pack(side="right")
 
-        ctk.CTkButton(prof_bar, text="Import", width=54, height=26, fg_color=COLORS["key_special"], hover_color=COLORS["accent"], command=self.import_profile).pack(side="left", padx=2)
-        ctk.CTkButton(prof_bar, text="Export", width=54, height=26, fg_color=COLORS["key_special"], hover_color=COLORS["accent"], command=self.export_profile).pack(side="left", padx=(2, 6))
-
-        # Color Theme Selector Bar
-        theme_bar = ctk.CTkFrame(header, fg_color=COLORS["bg_dark"], corner_radius=10, border_width=1, border_color=COLORS["card_border"])
-        theme_bar.pack(side="left", padx=6, pady=8, ipadx=4, ipady=3)
-
-        ctk.CTkLabel(theme_bar, text="🎨 Theme:", font=ctk.CTkFont(size=12, weight="bold"), text_color=COLORS["text_muted"]).pack(side="left", padx=(8, 4))
-        self.opt_theme = ctk.CTkOptionMenu(
-            theme_bar, values=list(THEME_PRESETS.keys()), width=128, height=28,
-            fg_color=COLORS["card_bg"], button_color=COLORS["accent"], button_hover_color=COLORS["accent_hover"],
-            command=self.change_color_theme
+        # ================= LEFT: tabbed settings =================
+        self.sidebar_tabs = ctk.CTkTabview(
+            self, width=360, fg_color=COLORS["card_bg"], border_width=1, border_color=COLORS["card_border"],
+            segmented_button_selected_color=COLORS["accent"],
+            segmented_button_selected_hover_color=COLORS["accent_hover"],
+            command=self._on_sidebar_tab
         )
-        self.opt_theme.set(APP_STATE.get("color_theme", "Ocean Blue"))
-        self.opt_theme.pack(side="left", padx=(2, 6))
+        self.sidebar_tabs.grid(row=1, column=0, sticky="nsew", padx=(14, 6), pady=(0, 12))
+        self.main_containers.append(self.sidebar_tabs)
 
-        right_controls = ctk.CTkFrame(header, fg_color="transparent")
-        right_controls.pack(side="right", padx=12, pady=10)
+        tab_names = ["Controller", "Cursor", "Extras", "Settings"]
+        tabs = {}
+        for name in tab_names:
+            tab = self.sidebar_tabs.add(name)
+            body = ctk.CTkScrollableFrame(tab, fg_color="transparent")
+            body.pack(fill="both", expand=True)
+            tabs[name] = body
 
-        self.btn_minimize = ctk.CTkButton(
-            right_controls, text="Tray", width=58, height=32,
-            fg_color=COLORS["key_special"], hover_color=COLORS["accent_hover"],
-            command=self.hide_window
-        )
-        self.btn_minimize.pack(side="right", padx=(6, 0))
-
-        upd_txt = "🔄 Check Update"
-        upd_col = COLORS["key_special"]
-        if self._last_update_res and self._last_update_res.get("status") == "update_available":
-            upd_txt = f"⬇ v{self._last_update_res.get('latest_ver')} Ready!"
-            upd_col = COLORS["success"]
-
-        self.btn_check_update = ctk.CTkButton(
-            right_controls, text=upd_txt, width=116, height=32,
-            fg_color=upd_col, hover_color=COLORS["accent"],
-            font=ctk.CTkFont(size=12, weight="bold"),
-            command=lambda: self.trigger_update_check(manual=True)
-        )
-        self.btn_check_update.pack(side="right", padx=5)
-
-        self.switch_master = ctk.CTkSwitch(
-            right_controls, text="Master",
-            font=ctk.CTkFont(size=13, weight="bold"),
-            progress_color=COLORS["success"], width=78,
-            command=self.toggle_master
-        )
-        if APP_STATE["enabled"]:
-            self.switch_master.select()
-        self.switch_master.pack(side="right", padx=5)
-
-        self.lbl_shift_indicator = ctk.CTkLabel(
-            right_controls, text="SHIFT IDLE",
-            font=ctk.CTkFont(size=11, weight="bold"),
-            fg_color=COLORS["card_border"], text_color=COLORS["text_muted"],
-            corner_radius=6, width=82, height=26
-        )
-        self.lbl_shift_indicator.pack(side="right", padx=5)
-
-        # --- LEFT SCROLLABLE SIDEBAR ---
-        sidebar = ctk.CTkScrollableFrame(self, width=365, fg_color="transparent")
-        sidebar.grid(row=1, column=0, sticky="nsew", padx=(12, 6), pady=(6, 14))
-        self.main_containers.append(sidebar)
-
-        # Card 1: Hardware & Auto-Switching Rules
-        dev_card = ctk.CTkFrame(sidebar, fg_color=COLORS["card_bg"], corner_radius=12, border_width=1, border_color=COLORS["card_border"])
-        dev_card.pack(fill="x", pady=(0, 10), padx=4)
-
-        ctk.CTkLabel(dev_card, text="CONTROLLER & AUTO-SWITCHING", font=ctk.CTkFont(size=11, weight="bold"), text_color=COLORS["accent"]).pack(anchor="w", padx=14, pady=(10, 4))
-
+        # ---------- Tab: Controller ----------
+        t = tabs["Controller"]
+        self._section(t, "Device", first=True)
         self.opt_controller = ctk.CTkOptionMenu(
-            dev_card, values=APP_STATE["available_controllers"],
-            fg_color=COLORS["bg_dark"], button_color=COLORS["accent"], button_hover_color=COLORS["accent_hover"],
-            command=self.change_priority
+            t, values=APP_STATE["available_controllers"], fg_color=COLORS["bg_dark"],
+            button_color=COLORS["accent"], button_hover_color=COLORS["accent_hover"], command=self.change_priority
         )
-        self.opt_controller.pack(fill="x", padx=14, pady=(0, 8))
+        self.opt_controller.pack(fill="x", padx=6, pady=(0, 6))
 
-        scan_row = ctk.CTkFrame(dev_card, fg_color="transparent")
-        scan_row.pack(fill="x", padx=14, pady=(0, 8))
-
-        self.chk_autoscan = ctk.CTkSwitch(scan_row, text="Auto-Scan", progress_color=COLORS["accent"], command=self.toggle_autoscan, width=90)
+        scan_row = ctk.CTkFrame(t, fg_color="transparent")
+        scan_row.pack(fill="x", padx=6, pady=(0, 4))
+        self.chk_autoscan = ctk.CTkSwitch(scan_row, text="Auto-scan every", progress_color=COLORS["accent"],
+                                          command=self.toggle_autoscan, width=90)
         if APP_STATE["auto_scan"]:
             self.chk_autoscan.select()
         self.chk_autoscan.pack(side="left")
-
         self.ent_interval = ctk.CTkEntry(scan_row, width=38, height=26, justify="center")
         self.ent_interval.insert(0, str(int(APP_STATE["scan_interval"])))
         self.ent_interval.bind("<KeyRelease>", self.update_interval)
         self.ent_interval.pack(side="left", padx=(6, 2))
         ctk.CTkLabel(scan_row, text="s", text_color=COLORS["text_muted"]).pack(side="left")
+        self._small_btn(scan_row, "Rescan", self.request_rescan, width=70).pack(side="right")
 
-        ctk.CTkButton(scan_row, text="Rescan", width=65, height=26, fg_color=COLORS["key_special"], hover_color=COLORS["accent"], command=self.request_rescan).pack(side="right")
-
-        ctk.CTkLabel(dev_card, text="Profile App Match Keywords (comma-separated):", font=ctk.CTkFont(size=11), text_color=COLORS["text_muted"]).pack(anchor="w", padx=14, pady=(4, 2))
-        self.ent_app_rules = ctk.CTkEntry(dev_card, height=28, placeholder_text="e.g. vlc, spotify, chrome")
-        self.ent_app_rules.insert(0, get_current_profile().get("app_rules", ""))
-        self.ent_app_rules.bind("<KeyRelease>", self.update_app_rules)
-        self.ent_app_rules.pack(fill="x", padx=14, pady=(0, 6))
-
-        self.chk_autoswitch = ctk.CTkSwitch(dev_card, text="Auto-Switch Profile by Active Window", progress_color=COLORS["accent"], command=self.toggle_autoswitch)
-        if APP_STATE["auto_switch_profiles"]:
-            self.chk_autoswitch.select()
-        self.chk_autoswitch.pack(anchor="w", padx=14, pady=3)
-
-        self.chk_gamepause = ctk.CTkSwitch(dev_card, text="Auto-Pause in Fullscreen Games", progress_color=COLORS["accent"], command=self.toggle_gamepause)
-        if APP_STATE["auto_pause_fullscreen"]:
-            self.chk_gamepause.select()
-        self.chk_gamepause.pack(anchor="w", padx=14, pady=(3, 10))
-
-        # Card 2: Precision Cursor, Deadzone & 2D Stick Visualizer
-        sens_card = ctk.CTkFrame(sidebar, fg_color=COLORS["card_bg"], corner_radius=12, border_width=1, border_color=COLORS["card_border"])
-        sens_card.pack(fill="x", pady=(0, 10), padx=4)
-
-        ctk.CTkLabel(sens_card, text="PRECISION CURSOR & DEADZONE", font=ctk.CTkFont(size=11, weight="bold"), text_color=COLORS["accent"]).pack(anchor="w", padx=14, pady=(10, 4))
-
-        vis_row = ctk.CTkFrame(sens_card, fg_color="transparent")
-        vis_row.pack(fill="x", padx=14, pady=4)
-
-        self.stick_canvas = tk.Canvas(vis_row, width=96, height=96, bg=COLORS["bg_dark"], highlightthickness=1, highlightbackground=COLORS["card_border"])
+        self._section(t, "Live Input Test")
+        vis_row = ctk.CTkFrame(t, fg_color="transparent")
+        vis_row.pack(fill="x", padx=6, pady=2)
+        self.stick_canvas = tk.Canvas(vis_row, width=96, height=96, bg=COLORS["bg_dark"],
+                                      highlightthickness=1, highlightbackground=COLORS["card_border"])
         self.stick_canvas.pack(side="left", padx=(0, 12))
-
         vis_info = ctk.CTkFrame(vis_row, fg_color="transparent")
         vis_info.pack(side="left", fill="both", expand=True)
-
-        self.lbl_speed_scale = ctk.CTkLabel(vis_info, text="Speed Scale: 1.00x", font=ctk.CTkFont(size=12, weight="bold"), text_color=COLORS["success"], anchor="w")
-        self.lbl_speed_scale.pack(anchor="w", pady=(2, 4))
-
-        ctk.CTkLabel(vis_info, text="LT Sniper (30%) / RT Boost (200%)", font=ctk.CTkFont(size=11), text_color=COLORS["text_muted"], anchor="w").pack(anchor="w")
+        self.lbl_speed_scale = ctk.CTkLabel(vis_info, text="Speed Scale: 1.00x", font=ctk.CTkFont(size=12, weight="bold"),
+                                            text_color=COLORS["success"], anchor="w")
+        self.lbl_speed_scale.pack(anchor="w", pady=(4, 6))
+        ctk.CTkLabel(vis_info, text="LT", font=ctk.CTkFont(size=11), text_color=COLORS["text_muted"], anchor="w").pack(anchor="w")
         self.bar_lt = ctk.CTkProgressBar(vis_info, height=8, progress_color=COLORS["warning"])
         self.bar_lt.set(0)
-        self.bar_lt.pack(fill="x", pady=(4, 3))
-
+        self.bar_lt.pack(fill="x", pady=(0, 4))
+        ctk.CTkLabel(vis_info, text="RT", font=ctk.CTkFont(size=11), text_color=COLORS["text_muted"], anchor="w").pack(anchor="w")
         self.bar_rt = ctk.CTkProgressBar(vis_info, height=8, progress_color=COLORS["accent"])
         self.bar_rt.set(0)
-        self.bar_rt.pack(fill="x", pady=(0, 4))
+        self.bar_rt.pack(fill="x")
 
-        self.chk_trig_prec = ctk.CTkSwitch(vis_info, text="Analog Trigger Speed", progress_color=COLORS["accent"], command=self.toggle_trig_precision)
-        if APP_STATE["trigger_Precision"]:
-            self.chk_trig_prec.select()
-        self.chk_trig_prec.pack(anchor="w")
+        self._section(t, "Buttons")
+        self.opt_toggle_btn = self._option_row(t, "Hold-to-toggle button", list(BTN_NAMES.values()),
+                                               BTN_NAMES.get(APP_STATE["toggle_button"], "Start / Menu"), self.change_toggle_btn)
+        self.opt_combo_btn = self._option_row(t, "Combo shift key", ["None", "LT", "RT", "LB", "RB"],
+                                              APP_STATE.get("combo_modifier", "None"), self.change_combo_mod)
+        self.chk_swap = self._switch(t, "Swap left & right sticks", APP_STATE["swap_sticks"], self.toggle_swap)
 
-        m_row = ctk.CTkFrame(sens_card, fg_color="transparent")
-        m_row.pack(fill="x", padx=14, pady=(6, 0))
-        ctk.CTkLabel(m_row, text="Cursor Speed").pack(side="left")
-        self.lbl_mouse_val = ctk.CTkLabel(m_row, text=f"{APP_STATE['mouse_speed']:.0f}", text_color=COLORS["accent"], font=ctk.CTkFont(weight="bold"))
-        self.lbl_mouse_val.pack(side="right")
-        self.mouse_slider = ctk.CTkSlider(sens_card, from_=2, to=40, button_color=COLORS["accent"], progress_color=COLORS["accent"], command=self.update_mouse)
-        self.mouse_slider.set(APP_STATE["mouse_speed"])
-        self.mouse_slider.pack(fill="x", padx=14, pady=(2, 6))
+        # ---------- Tab: Cursor ----------
+        t = tabs["Cursor"]
+        self._section(t, "Mouse", first=True)
+        self.lbl_mouse_val, self.mouse_slider = self._slider(
+            t, "Cursor speed", f"{APP_STATE['mouse_speed']:.0f}", COLORS["accent"], 2, 40, APP_STATE["mouse_speed"], self.update_mouse)
+        self.lbl_dz_val, self.dz_slider = self._slider(
+            t, "Stick deadzone", f"{int(APP_STATE['deadzone']*100)}%", COLORS["warning"], 0.05, 0.35, APP_STATE["deadzone"], self.update_deadzone)
+        self.lbl_scroll_val, self.scroll_slider = self._slider(
+            t, "Scroll speed", f"{APP_STATE['scroll_speed']:.1f}x", COLORS["accent"], 0.2, 5.0, APP_STATE["scroll_speed"], self.update_scroll)
 
-        dz_row = ctk.CTkFrame(sens_card, fg_color="transparent")
-        dz_row.pack(fill="x", padx=14)
-        ctk.CTkLabel(dz_row, text="Stick Deadzone").pack(side="left")
-        self.lbl_dz_val = ctk.CTkLabel(dz_row, text=f"{int(APP_STATE['deadzone']*100)}%", text_color=COLORS["warning"], font=ctk.CTkFont(weight="bold"))
-        self.lbl_dz_val.pack(side="right")
-        self.dz_slider = ctk.CTkSlider(sens_card, from_=0.05, to=0.35, button_color=COLORS["accent"], progress_color=COLORS["accent"], command=self.update_deadzone)
-        self.dz_slider.set(APP_STATE["deadzone"])
-        self.dz_slider.pack(fill="x", padx=14, pady=(2, 6))
+        self._section(t, "Triggers")
+        self.chk_trig_prec = self._switch(t, "Analog trigger speed (LT slow / RT fast)", APP_STATE["trigger_Precision"], self.toggle_trig_precision)
 
-        s_row = ctk.CTkFrame(sens_card, fg_color="transparent")
-        s_row.pack(fill="x", padx=14)
-        ctk.CTkLabel(s_row, text="Scroll Speed").pack(side="left")
-        self.lbl_scroll_val = ctk.CTkLabel(s_row, text=f"{APP_STATE['scroll_speed']:.1f}x", text_color=COLORS["accent"], font=ctk.CTkFont(weight="bold"))
-        self.lbl_scroll_val.pack(side="right")
-        self.scroll_slider = ctk.CTkSlider(sens_card, from_=0.2, to=5.0, button_color=COLORS["accent"], progress_color=COLORS["accent"], command=self.update_scroll)
-        self.scroll_slider.set(APP_STATE["scroll_speed"])
-        self.scroll_slider.pack(fill="x", padx=14, pady=(2, 10))
+        self._section(t, "Turbo")
+        self.lbl_turbo_val, self.turbo_slider = self._slider(
+            t, "Rapid-fire rate", f"{APP_STATE['turbo_rate']:.0f} CPS", COLORS["warning"], 5, 25, APP_STATE["turbo_rate"], self.update_turbo_rate)
 
-        # Card 3: Modifiers, Turbo Rate & Startup / Update Settings
-        pref_card = ctk.CTkFrame(sidebar, fg_color=COLORS["card_bg"], corner_radius=12, border_width=1, border_color=COLORS["card_border"])
-        pref_card.pack(fill="x", padx=4, pady=(0, 10))
-
-        ctk.CTkLabel(pref_card, text="TURBO, MODIFIERS & UPDATES", font=ctk.CTkFont(size=11, weight="bold"), text_color=COLORS["accent"]).pack(anchor="w", padx=14, pady=(10, 6))
-
-        t_row = ctk.CTkFrame(pref_card, fg_color="transparent")
-        t_row.pack(fill="x", padx=14)
-        ctk.CTkLabel(t_row, text="⚡ Turbo Rapid-Fire Rate").pack(side="left")
-        self.lbl_turbo_val = ctk.CTkLabel(t_row, text=f"{APP_STATE['turbo_rate']:.0f} CPS", text_color=COLORS["warning"], font=ctk.CTkFont(weight="bold"))
-        self.lbl_turbo_val.pack(side="right")
-        self.turbo_slider = ctk.CTkSlider(pref_card, from_=5, to=25, button_color=COLORS["accent"], progress_color=COLORS["accent"], command=self.update_turbo_rate)
-        self.turbo_slider.set(APP_STATE["turbo_rate"])
-        self.turbo_slider.pack(fill="x", padx=14, pady=(2, 8))
-
-        grid_f = ctk.CTkFrame(pref_card, fg_color="transparent")
-        grid_f.pack(fill="x", padx=14)
-        grid_f.grid_columnconfigure(0, weight=1)
-
-        ctk.CTkLabel(grid_f, text="Hold Toggle Btn:").grid(row=0, column=0, sticky="w", pady=4)
-        self.opt_toggle_btn = ctk.CTkOptionMenu(grid_f, values=list(BTN_NAMES.values()), width=140, fg_color=COLORS["bg_dark"], button_color=COLORS["accent"], button_hover_color=COLORS["accent_hover"], command=self.change_toggle_btn)
-        self.opt_toggle_btn.set(BTN_NAMES.get(APP_STATE["toggle_button"], "Start / Menu"))
-        self.opt_toggle_btn.grid(row=0, column=1, sticky="e", pady=4)
-
-        ctk.CTkLabel(grid_f, text="Combo Shift Key:").grid(row=1, column=0, sticky="w", pady=4)
-        self.opt_combo_btn = ctk.CTkOptionMenu(grid_f, values=["None", "LT", "RT", "LB", "RB"], width=140, fg_color=COLORS["bg_dark"], button_color=COLORS["accent"], button_hover_color=COLORS["accent_hover"], command=self.change_combo_mod)
-        self.opt_combo_btn.set(APP_STATE.get("combo_modifier", "LB"))
-        self.opt_combo_btn.grid(row=1, column=1, sticky="e", pady=4)
-
-        self.chk_swap = ctk.CTkSwitch(pref_card, text="Swap Left & Right Sticks", progress_color=COLORS["accent"], command=self.toggle_swap)
-        if APP_STATE["swap_sticks"]:
-            self.chk_swap.select()
-        self.chk_swap.pack(anchor="w", padx=14, pady=(8, 4))
-
-        self.chk_startup = ctk.CTkSwitch(pref_card, text="Launch on System Startup", progress_color=COLORS["accent"], command=self.toggle_autostart)
-        if is_autostart_enabled():
-            self.chk_startup.select()
-        self.chk_startup.pack(anchor="w", padx=14, pady=4)
-
-        self.chk_update_startup = ctk.CTkSwitch(pref_card, text="Auto-Check Updates on Startup", progress_color=COLORS["accent"], command=self.toggle_update_on_startup)
-        if APP_STATE.get("check_updates_on_startup", True):
-            self.chk_update_startup.select()
-        self.chk_update_startup.pack(anchor="w", padx=14, pady=(4, 12))
-
-        # Card 4: Optional Couch & Power Extensions (All Disabled by Default)
-        ext_card = ctk.CTkFrame(sidebar, fg_color=COLORS["card_bg"], corner_radius=12, border_width=1, border_color=COLORS["card_border"])
-        ext_card.pack(fill="x", padx=4, pady=(0, 8))
-
-        ctk.CTkLabel(ext_card, text="COUCH & POWER EXTENSIONS (OFF BY DEFAULT)", font=ctk.CTkFont(size=11, weight="bold"), text_color=COLORS["accent"]).pack(anchor="w", padx=14, pady=(10, 6))
-
-        self.chk_hud = ctk.CTkSwitch(ext_card, text="On-Screen Shortcut HUD Overlay", progress_color=COLORS["accent"], command=self.toggle_hud)
-        if APP_STATE.get("hud_enabled", False):
-            self.chk_hud.select()
-        self.chk_hud.pack(anchor="w", padx=14, pady=4)
-
-        rad_row = ctk.CTkFrame(ext_card, fg_color="transparent")
-        rad_row.pack(fill="x", padx=14, pady=4)
-        self.chk_radial = ctk.CTkSwitch(rad_row, text="8-Way Radial Pie Wheel", progress_color=COLORS["accent"], command=self.toggle_radial_wheel)
+        # ---------- Tab: Extras (all off by default) ----------
+        t = tabs["Extras"]
+        self._section(t, "Overlays", first=True)
+        self.chk_hud = self._switch(t, "Shortcut HUD overlay", APP_STATE.get("hud_enabled", False), self.toggle_hud)
+        rad_row = ctk.CTkFrame(t, fg_color="transparent")
+        rad_row.pack(fill="x", padx=6, pady=3)
+        self.chk_radial = ctk.CTkSwitch(rad_row, text="8-way radial wheel", progress_color=COLORS["accent"], command=self.toggle_radial_wheel)
         if APP_STATE.get("radial_wheel_enabled", False):
             self.chk_radial.select()
         self.chk_radial.pack(side="left")
-        ctk.CTkButton(rad_row, text="Edit Slots", width=72, height=24, fg_color=COLORS["key_special"], hover_color=COLORS["accent"], command=lambda: RadialWheelEditor(self)).pack(side="right")
+        self._small_btn(rad_row, "Edit Slots", lambda: RadialWheelEditor(self), width=80).pack(side="right")
+        self.chk_daisy = self._switch(t, "Daisywheel stick typing", APP_STATE.get("daisywheel_enabled", False), self.toggle_daisywheel)
+        self.chk_laser = self._switch(t, "Cursor laser-pointer ring", APP_STATE.get("laser_ring_enabled", False), self.toggle_laser_ring)
 
-        self.chk_daisy = ctk.CTkSwitch(ext_card, text="Daisywheel Thumbstick Typing", progress_color=COLORS["accent"], command=self.toggle_daisywheel)
-        if APP_STATE.get("daisywheel_enabled", False):
-            self.chk_daisy.select()
-        self.chk_daisy.pack(anchor="w", padx=14, pady=4)
+        self._section(t, "Behaviour")
+        self.chk_edgewrap = self._switch(t, "Wrap cursor at screen edges", APP_STATE.get("edge_wrap_enabled", False), self.toggle_edge_wrap)
+        self.chk_beeps = self._switch(t, "Audio chime feedback", APP_STATE.get("audio_beeps_enabled", False), self.toggle_audio_beeps)
 
-        self.chk_edgewrap = ctk.CTkSwitch(ext_card, text="Screen-Edge Cursor Wrap (Pac-Man)", progress_color=COLORS["accent"], command=self.toggle_edge_wrap)
-        if APP_STATE.get("edge_wrap_enabled", False):
-            self.chk_edgewrap.select()
-        self.chk_edgewrap.pack(anchor="w", padx=14, pady=4)
+        self._section(t, "Power")
+        self.chk_idlesleep = self._switch(t, "Turn screen off when idle", APP_STATE.get("idle_sleep_enabled", False), self.toggle_idle_sleep)
+        self.lbl_idle_val, self.idle_slider = self._slider(
+            t, "Idle timeout", f"{APP_STATE['idle_timeout_min']:.0f} min", COLORS["accent"], 5, 60, APP_STATE["idle_timeout_min"], self.update_idle_timeout)
 
-        self.chk_laser = ctk.CTkSwitch(ext_card, text="Cursor Laser Pointer Ring", progress_color=COLORS["accent"], command=self.toggle_laser_ring)
-        if APP_STATE.get("laser_ring_enabled", False):
-            self.chk_laser.select()
-        self.chk_laser.pack(anchor="w", padx=14, pady=4)
+        # ---------- Tab: Settings ----------
+        t = tabs["Settings"]
+        self._section(t, "Profiles", first=True)
+        io_row = ctk.CTkFrame(t, fg_color="transparent")
+        io_row.pack(fill="x", padx=6, pady=(0, 4))
+        self._small_btn(io_row, "Import Profile", self.import_profile, width=120).pack(side="left")
+        self._small_btn(io_row, "Export Profile", self.export_profile, width=120).pack(side="left", padx=8)
+        ctk.CTkLabel(t, text="Use this profile when these apps are active:", font=ctk.CTkFont(size=11),
+                     text_color=COLORS["text_muted"], anchor="w").pack(fill="x", padx=6, pady=(6, 2))
+        self.ent_app_rules = ctk.CTkEntry(t, height=28, placeholder_text="e.g. vlc, spotify, chrome")
+        self.ent_app_rules.insert(0, get_current_profile().get("app_rules", ""))
+        self.ent_app_rules.bind("<KeyRelease>", self.update_app_rules)
+        self.ent_app_rules.pack(fill="x", padx=6, pady=(0, 4))
+        self.chk_autoswitch = self._switch(t, "Auto-switch profile by active window", APP_STATE["auto_switch_profiles"], self.toggle_autoswitch)
+        self.chk_gamepause = self._switch(t, "Auto-pause in fullscreen games", APP_STATE["auto_pause_fullscreen"], self.toggle_gamepause)
 
-        self.chk_beeps = ctk.CTkSwitch(ext_card, text="Audio Chime Feedback (Non-Rumble)", progress_color=COLORS["accent"], command=self.toggle_audio_beeps)
-        if APP_STATE.get("audio_beeps_enabled", False):
-            self.chk_beeps.select()
-        self.chk_beeps.pack(anchor="w", padx=14, pady=4)
+        self._section(t, "Appearance")
+        self.opt_theme = self._option_row(t, "Theme", list(THEME_PRESETS.keys()),
+                                          APP_STATE.get("color_theme", "Ocean Blue"), self.change_color_theme)
 
-        self.chk_idlesleep = ctk.CTkSwitch(ext_card, text="Inactivity Auto-Screen Off", progress_color=COLORS["accent"], command=self.toggle_idle_sleep)
-        if APP_STATE.get("idle_sleep_enabled", False):
-            self.chk_idlesleep.select()
-        self.chk_idlesleep.pack(anchor="w", padx=14, pady=(4, 2))
+        self._section(t, "System")
+        self.chk_startup = self._switch(t, "Launch on system startup", is_autostart_enabled(), self.toggle_autostart)
+        self.chk_update_startup = self._switch(t, "Check for updates on startup", APP_STATE.get("check_updates_on_startup", True), self.toggle_update_on_startup)
 
-        idle_row = ctk.CTkFrame(ext_card, fg_color="transparent")
-        idle_row.pack(fill="x", padx=14)
-        ctk.CTkLabel(idle_row, text="Idle Timeout").pack(side="left")
-        self.lbl_idle_val = ctk.CTkLabel(idle_row, text=f"{APP_STATE['idle_timeout_min']:.0f} min", text_color=COLORS["accent"], font=ctk.CTkFont(weight="bold"))
-        self.lbl_idle_val.pack(side="right")
-        self.idle_slider = ctk.CTkSlider(ext_card, from_=5, to=60, button_color=COLORS["accent"], progress_color=COLORS["accent"], command=self.update_idle_timeout)
-        self.idle_slider.set(APP_STATE["idle_timeout_min"])
-        self.idle_slider.pack(fill="x", padx=14, pady=(2, 12))
+        upd_txt, upd_col = "Check for Updates", COLORS["key_special"]
+        if self._last_update_res and self._last_update_res.get("status") == "update_available":
+            upd_txt = f"⬇ v{self._last_update_res.get('latest_ver')} Ready!"
+            upd_col = COLORS["success"]
+        self.btn_check_update = ctk.CTkButton(t, text=upd_txt, height=30, fg_color=upd_col, hover_color=COLORS["accent"],
+                                              command=lambda: self.trigger_update_check(manual=True))
+        self.btn_check_update.pack(fill="x", padx=6, pady=(8, 4))
 
-        # --- RIGHT PANEL (LIVE MAPPING MATRIX) ---
-        right_panel = ctk.CTkFrame(self, fg_color=COLORS["card_bg"], corner_radius=14, border_width=1, border_color=COLORS["card_border"])
-        right_panel.grid(row=1, column=1, sticky="nsew", padx=(6, 16), pady=(6, 14))
-        right_panel.grid_rowconfigure(1, weight=1)
+        try:
+            self.sidebar_tabs.set(getattr(self, "current_sidebar_tab", "Controller"))
+        except Exception:
+            pass
+
+        # ================= RIGHT: button mappings =================
+        right_panel = ctk.CTkFrame(self, fg_color=COLORS["card_bg"], corner_radius=12, border_width=1, border_color=COLORS["card_border"])
+        right_panel.grid(row=1, column=1, sticky="nsew", padx=(6, 14), pady=(0, 12))
+        right_panel.grid_rowconfigure(2, weight=1)
         right_panel.grid_columnconfigure(0, weight=1)
         self.main_containers.append(right_panel)
 
         remap_header = ctk.CTkFrame(right_panel, fg_color="transparent")
-        remap_header.grid(row=0, column=0, sticky="ew", padx=16, pady=(12, 6))
-
-        ctk.CTkLabel(remap_header, text="BUTTON MAPPINGS & FIRE MODES", font=ctk.CTkFont(size=13, weight="bold"), text_color=COLORS["text_muted"]).pack(side="left")
+        remap_header.grid(row=0, column=0, sticky="ew", padx=14, pady=(12, 0))
+        ctk.CTkLabel(remap_header, text="Button Mappings", font=ctk.CTkFont(size=15, weight="bold")).pack(side="left")
 
         ctk.CTkButton(
-            remap_header, text="Reset Profile", width=100, height=28,
+            remap_header, text="Reset", width=64, height=28,
             fg_color="transparent", border_width=1, border_color=COLORS["card_border"],
             text_color=COLORS["text_muted"], hover_color=COLORS["danger"],
             command=self.reset_current_mappings
         ).pack(side="right", padx=(8, 0))
 
         self.seg_mode = ctk.CTkSegmentedButton(
-            remap_header,
-            values=["Standard", "Combo (Hold Shift)"],
-            selected_color=COLORS["accent"],
-            selected_hover_color=COLORS["accent_hover"],
+            remap_header, values=["Standard", "Combo (Hold Shift)"],
+            selected_color=COLORS["accent"], selected_hover_color=COLORS["accent_hover"],
             command=self.switch_remap_mode
         )
         self.seg_mode.set(self.current_remap_mode)
         self.seg_mode.pack(side="right")
 
+        self.lbl_shift_indicator = ctk.CTkLabel(
+            remap_header, text="SHIFT IDLE", font=ctk.CTkFont(size=10, weight="bold"),
+            fg_color=COLORS["card_border"], text_color=COLORS["text_muted"], corner_radius=6, width=74, height=24
+        )
+        self.lbl_shift_indicator.pack(side="right", padx=8)
+
+        ctk.CTkLabel(
+            right_panel, text="Click an action to change it  ·  click the mode to cycle Normal → Turbo → Toggle",
+            font=ctk.CTkFont(size=11), text_color=COLORS["text_muted"], anchor="w"
+        ).grid(row=1, column=0, sticky="ew", padx=16, pady=(2, 4))
+
         self.scroll_frame = ctk.CTkScrollableFrame(right_panel, fg_color="transparent")
-        self.scroll_frame.grid(row=1, column=0, sticky="nsew", padx=10, pady=(0, 10))
+        self.scroll_frame.grid(row=2, column=0, sticky="nsew", padx=8, pady=(0, 8))
 
         self.render_remap_list()
 
@@ -2631,15 +2877,15 @@ class ModernControllerApp(ctk.CTk):
             return f"Reserved ({APP_STATE['combo_modifier']} Shift)", COLORS["warning"], "#000000"
 
         if is_combo:
-            act = prof["combo_mappings"].get(btn_id, "None")
+            act = get_dict_val(prof.get("combo_mappings", {}), btn_id, "None")
             if act and act != "None":
                 return act[:30], COLORS["accent"], COLORS["text_main"]
-            std_act = prof["mappings"].get(btn_id, "None")
+            std_act = get_dict_val(prof.get("mappings", {}), btn_id, "None")
             if std_act and std_act != "None":
                 return f"Fallback → {std_act[:20]}", "transparent", COLORS["text_muted"]
             return "None", "transparent", COLORS["text_muted"]
         else:
-            act = prof["mappings"].get(btn_id, "None")
+            act = get_dict_val(prof.get("mappings", {}), btn_id, "None")
             if act and act != "None":
                 return act[:30], COLORS["key_special"], COLORS["text_main"]
             if APP_STATE["trigger_Precision"] and btn_id == 106:
@@ -2653,7 +2899,7 @@ class ModernControllerApp(ctk.CTk):
             return "⚡ Turbo", COLORS["warning"], "#000000"
         elif mode == "Toggle":
             return "🔒 Toggle", COLORS["accent"], COLORS["text_main"]
-        return "1x Normal", COLORS["key_std"], COLORS["text_muted"]
+        return "Normal", COLORS["key_std"], COLORS["text_muted"]
 
     def render_remap_list(self):
         for widget in self.scroll_frame.winfo_children():
@@ -2671,46 +2917,47 @@ class ModernControllerApp(ctk.CTk):
                 self.scroll_frame, text=category.upper(),
                 font=ctk.CTkFont(size=11, weight="bold"), text_color=COLORS["accent"]
             )
-            cat_lbl.pack(anchor="w", padx=10, pady=(8, 3))
+            cat_lbl.pack(anchor="w", padx=8, pady=(10, 2))
 
             for btn_id in btn_ids:
                 btn_name = BTN_NAMES[btn_id]
-                row = ctk.CTkFrame(self.scroll_frame, fg_color=COLORS["row_idle"], corner_radius=8, height=42)
-                row.pack(fill="x", pady=2, padx=6)
+                row = ctk.CTkFrame(self.scroll_frame, fg_color=COLORS["row_idle"], corner_radius=8)
+                row.pack(fill="x", pady=2, padx=4)
+                row.grid_columnconfigure(0, weight=1)
                 self.mapping_rows[btn_id] = row
 
                 ctk.CTkLabel(
-                    row, text=btn_name, width=140, anchor="w",
-                    font=ctk.CTkFont(size=13, weight="bold")
-                ).pack(side="left", padx=(12, 4), pady=7)
-
-                cur_mode = prof["btn_modes"].get(btn_id, "Normal")
-                m_txt, m_bg, m_fg = self.format_mode_btn_style(cur_mode)
-                mode_btn = ctk.CTkButton(
-                    row, text=m_txt, width=84, height=26,
-                    fg_color=m_bg, text_color=m_fg, hover_color=COLORS["card_border"],
-                    font=ctk.CTkFont(size=11, weight="bold"), corner_radius=6,
-                    command=lambda b_id=btn_id: self.cycle_button_mode(b_id)
-                )
-                mode_btn.pack(side="right", padx=(4, 10), pady=6)
-                self.mode_buttons[btn_id] = mode_btn
+                    row, text=btn_name, anchor="w", font=ctk.CTkFont(size=13, weight="bold")
+                ).grid(row=0, column=0, sticky="w", padx=(12, 4), pady=5)
 
                 txt, bg_col, txt_col = self.format_badge_state(btn_id, is_combo)
                 badge = ctk.CTkButton(
-                    row, text=txt, height=26,
+                    row, text=txt, width=200, height=28,
                     fg_color=bg_col, hover_color=COLORS["accent"],
                     text_color=txt_col, corner_radius=6,
                     command=lambda b_id=btn_id, c=is_combo: VisualPicker(self, b_id, c, self.update_mapping)
                 )
-                badge.pack(side="right", padx=4, pady=6)
+                badge.grid(row=0, column=1, padx=4, pady=5)
                 self.mapping_badges[btn_id] = badge
+
+                cur_mode = get_dict_val(prof.get("btn_modes", {}), btn_id, "Normal")
+                m_txt, m_bg, m_fg = self.format_mode_btn_style(cur_mode)
+                mode_btn = ctk.CTkButton(
+                    row, text=m_txt, width=84, height=28,
+                    fg_color=m_bg, text_color=m_fg, hover_color=COLORS["card_border"],
+                    font=ctk.CTkFont(size=11, weight="bold"), corner_radius=6,
+                    command=lambda b_id=btn_id: self.cycle_button_mode(b_id)
+                )
+                mode_btn.grid(row=0, column=2, padx=(4, 10), pady=5)
+                self.mode_buttons[btn_id] = mode_btn
 
     def cycle_button_mode(self, btn_id):
         order = ["Normal", "Turbo", "Toggle"]
         prof = get_current_profile()
-        cur = prof["btn_modes"].get(btn_id, "Normal")
+        cur = get_dict_val(prof.get("btn_modes", {}), btn_id, "Normal")
         nxt = order[(order.index(cur) + 1) % len(order)]
-        prof["btn_modes"][btn_id] = nxt
+        prof["btn_modes"][int(btn_id)] = nxt
+        prof["btn_modes"].pop(str(btn_id), None)
         m_txt, m_bg, m_fg = self.format_mode_btn_style(nxt)
         if btn_id in self.mode_buttons:
             self.mode_buttons[btn_id].configure(text=m_txt, fg_color=m_bg, text_color=m_fg)
@@ -2753,7 +3000,7 @@ class ModernControllerApp(ctk.CTk):
                 with open(path, "r", encoding="utf-8") as f:
                     loaded = json.load(f)
                 p_name = loaded.get("profile_name", Path(path).stem.replace("JeetPad_", ""))
-                p_data = sanitize_profile_dict(loaded.get("profile_data", loaded))
+                p_data = sanitize_profile_dict(loaded.get("profile_data", loaded), p_name)
                 with STATE_LOCK:
                     APP_STATE["profiles"][p_name] = p_data
                     APP_STATE["active_profile"] = p_name
@@ -2771,8 +3018,7 @@ class ModernControllerApp(ctk.CTk):
         p_name = APP_STATE["active_profile"]
         with STATE_LOCK:
             if p_name in DEFAULT_PROFILES:
-                APP_STATE["profiles"][p_name] = json.loads(json.dumps(DEFAULT_PROFILES[p_name]))
-                APP_STATE["profiles"][p_name] = sanitize_profile_dict(APP_STATE["profiles"][p_name])
+                APP_STATE["profiles"][p_name] = sanitize_profile_dict(DEFAULT_PROFILES[p_name], p_name)
             else:
                 APP_STATE["profiles"][p_name] = make_profile(BASE_DESKTOP_MAP)
         save_config()
@@ -2782,9 +3028,11 @@ class ModernControllerApp(ctk.CTk):
         prof = get_current_profile()
         with STATE_LOCK:
             if is_combo:
-                prof["combo_mappings"][btn_id] = new_action
+                prof["combo_mappings"][int(btn_id)] = new_action
+                prof["combo_mappings"].pop(str(btn_id), None)
             else:
-                prof["mappings"][btn_id] = new_action
+                prof["mappings"][int(btn_id)] = new_action
+                prof["mappings"].pop(str(btn_id), None)
         save_config()
         self.refresh_badges()
 
@@ -2795,7 +3043,7 @@ class ModernControllerApp(ctk.CTk):
             txt, bg_col, txt_col = self.format_badge_state(btn_id, is_combo)
             badge.configure(text=txt, fg_color=bg_col, text_color=txt_col)
             if btn_id in self.mode_buttons:
-                m_txt, m_bg, m_fg = self.format_mode_btn_style(prof["btn_modes"].get(btn_id, "Normal"))
+                m_txt, m_bg, m_fg = self.format_mode_btn_style(get_dict_val(prof.get("btn_modes", {}), btn_id, "Normal"))
                 self.mode_buttons[btn_id].configure(text=m_txt, fg_color=m_bg, text_color=m_fg)
 
     def request_rescan(self):
@@ -2811,6 +3059,8 @@ class ModernControllerApp(ctk.CTk):
 
     def toggle_gamepause(self):
         APP_STATE["auto_pause_fullscreen"] = bool(self.chk_gamepause.get())
+        if not APP_STATE["auto_pause_fullscreen"]:
+            APP_STATE["auto_paused_by_game"] = False
         save_config()
 
     def toggle_trig_precision(self):
@@ -2961,6 +3211,8 @@ class ModernControllerApp(ctk.CTk):
         self.lbl_speed_scale.configure(text=f"Speed Scale: {mult:.2f}x")
 
     def update_ui_loop(self):
+        # NOTE: SDL events are pumped by controller_worker on its own thread. Pumping
+        # here (a different thread) left controller input frozen on Windows.
         current_list = APP_STATE["available_controllers"]
         if self.opt_controller.cget("values") != current_list:
             self.opt_controller.configure(values=current_list)
@@ -3021,7 +3273,7 @@ class ModernControllerApp(ctk.CTk):
                 row_widget.configure(fg_color=target_col)
 
         self.draw_stick_visualizer()
-        self.after(50, self.update_ui_loop)
+        self.after(30, self.update_ui_loop)
 
     def create_fallback_icon(self):
         img = Image.new("RGBA", (64, 64), (0, 0, 0, 0))
@@ -3094,6 +3346,8 @@ if __name__ == "__main__":
         ctypes.windll.shell32.ShellExecuteW(None, "runas", sys.executable, params, None, 1)
         sys.exit(0)
 
+    # pygame/SDL is initialised inside controller_worker so that init, event pumping
+    # and polling all happen on the same thread.
     threading.Thread(target=controller_worker, daemon=True).start()
     app = ModernControllerApp()
     app.mainloop()
