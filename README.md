@@ -73,7 +73,7 @@ cd JeetPad
 
 **2. Install dependencies:**
 bash
-python -m pip install pygame-ce pynput customtkinter pystray Pillow
+python -m pip install pygame-ce pynput customtkinter pystray Pillow pyinstaller
 
 
 **3. Run the app:**
@@ -86,13 +86,18 @@ We use PyInstaller to package the app. Make sure your `icon.ico` and `icon.png` 
 
 *For Windows:*<br>
 bash<br><br>
-python -m PyInstaller --noconsole --onefile --name "JeetPad" --icon=icon.ico --add-data "icon.ico;." --add-data "icon.png;." --hidden-import pygame --hidden-import pynput --hidden-import customtkinter app.py
+python -m PyInstaller --noconfirm JeetPad.spec
 
 
 *For Linux:*<br>
  bash<br><br>
-  python3 -m PyInstaller --noconsole --onefile --name "JeetPad" --add-data "icon.png:." --hidden-import pygame --hidden-import pynput --hidden-import customtkinter   app.py
+  python3 -m PyInstaller --noconsole --onefile --name "JeetPad" --add-data "icon.png:." --hidden-import pygame._sdl2.controller --hidden-import pynput.keyboard._xorg --hidden-import pynput.mouse._xorg --hidden-import pynput._util.xorg --hidden-import pynput._util.xorg_keysyms --hidden-import pystray._xorg --hidden-import customtkinter app.py
 
+
+**5. Publishing a release (GitHub Actions):**
+1. Bump `APP_VERSION` in `app.py` (e.g. `"1.3"` → `"1.4"`) and push.
+2. Go to **Actions → Build & Release JeetPad → Run workflow**.
+3. The workflow builds `JeetPad.exe` (Windows) and `JeetPad_Linux.zip` (Linux) and publishes them as release `v<APP_VERSION>`.
 
 ---
 
